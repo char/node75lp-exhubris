@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["xtask"]
+# Generated upstream checkouts have their own workspaces; without this,
+# Cargo claims their crates for this workspace.
+exclude = ["vendor/exhubris", "vendor/hubris"]
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = 2
+panic = "abort"
