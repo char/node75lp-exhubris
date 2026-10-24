@@ -1,0 +1,8 @@
+[package]
+name = "node75-kernel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hubris-kern = { package = "kern", path = "../vendor/hubris/sys/kern", features = ["ch582", "nano"] }
+node75-matrix = { path = "../lib/matrix" }

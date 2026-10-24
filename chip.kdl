@@ -1,0 +1,41 @@
+chip CH582
+target-triple riscv32imac-unknown-none-elf
+vector-table-size 144
+
+compatible {
+    - CH582
+    - qingke-v4a
+}
+
+// One PMP entry; this DMA-capable board driver is trusted, not peripheral-isolated.
+peripheral trusted-board-io {
+    base 0x4000_0000
+    size 0x1_0000
+}
+
+memory {
+    region vectors {
+        base 0x0001_3000
+        size 0x1000
+        read
+    }
+    region flash {
+        base 0x0001_4000
+        size 0x44AF0
+        read
+        execute
+    }
+    region recovery {
+        base 0x2000_0000
+        size 0x800
+        read
+        write
+        execute
+    }
+    region ram {
+        base 0x2000_0800
+        size 0x7800
+        read
+        write
+    }
+}

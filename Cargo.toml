@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["xtask", "lib/usb"]
+members = ["kernel", "lib/matrix", "xtask", "lib/usb"]
 default-members = ["xtask", "lib/usb"]
 # Generated upstream checkouts have their own workspaces; without this,
 # Cargo claims their crates for this workspace.
