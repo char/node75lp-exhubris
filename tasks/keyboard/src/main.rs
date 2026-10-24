@@ -8,6 +8,10 @@ use node75_usb::{Action, Device};
 
 mod usb_hw;
 
+mod lighting_bridge;
+
+mod replies;
+
 mod board {
     pub struct Clock;
 
@@ -47,6 +51,7 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
     let mut keymap = node75_keymap::Keymap::new();
     let mut last_scan = clock.millis();
     let mut keys = [0; 6];
+    let mut observe = lighting_bridge::observer();
     loop {
         let mut now = clock.millis();
         if let Some(event) = hardware.poll() {
@@ -107,5 +112,7 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
         {
             device.report_queued(report);
         }
+        // GPIO and USB register transactions are complete before IPC can yield.
+        observe(keys, now, device.active(), device.leds());
     }
 }

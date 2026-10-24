@@ -1,0 +1,7 @@
+[package]
+name = "node75-lighting-api"
+version = "0.1.0"
+edition = "2024"
+description = "Keyboard/lighting IPC wire format for the Node75 LP"
+
+[dependencies]
