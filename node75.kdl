@@ -1,0 +1,15 @@
+app node75
+board "proj:board.kdl"
+
+kernel {
+    workspace-crate node75-kernel
+    stack-size 4096
+}
+
+task keyboard {
+    workspace-crate node75-keyboard
+    // Stateful keymap and nested USB calls exceed 2 KiB.
+    stack-size 4096
+    priority 0
+    uses-peripheral trusted-board-io
+}

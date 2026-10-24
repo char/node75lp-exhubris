@@ -1,12 +1,13 @@
+mod build;
 mod upstream;
 
 use std::{
     env, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -26,6 +27,8 @@ enum Cmd {
     },
     /// Remove the generated vendor/ checkouts
     CleanUpstreams,
+    /// Build a raw .bin (never accesses hardware)
+    Build,
 }
 
 fn main() -> ExitCode {
@@ -60,6 +63,10 @@ fn run() -> Result<()> {
                 }
             }
             println!("Removed generated vendor/exhubris/ and vendor/hubris/");
+        }
+        Cmd::Build => {
+            let toolchain = Toolchain::find()?;
+            build::build(&root, &toolchain)?;
         }
     }
     Ok(())
@@ -97,4 +104,76 @@ fn command_line(command: &Command) -> String {
 
 pub fn git() -> Command {
     Command::new("git")
+}
+
+pub fn exe(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    }
+}
+
+/// The pinned toolchain's real executables, bypassing rustup/cargo shims.
+/// The PoC's build environment misbehaved through the shims (a host mount
+/// point issue), so builds invoke the toolchain directory directly.
+pub struct Toolchain {
+    cargo: PathBuf,
+    rustc: PathBuf,
+    rustfmt: PathBuf,
+    objcopy: PathBuf,
+    host: String,
+}
+
+impl Toolchain {
+    fn find() -> Result<Self> {
+        // Cargo resolves rust-toolchain.toml and names its own real binary here.
+        let cargo = PathBuf::from(env::var_os("CARGO").context("run xtask via `cargo xtask`")?);
+        let bin = cargo.parent().context("CARGO has no parent directory")?;
+        let rustc = bin.join(exe("rustc"));
+        let printed =
+            capture(Command::new(&rustc).args(["--print", "host-tuple", "--print", "sysroot"]))?;
+        let Some((host, sysroot)) = printed.split_once('\n') else {
+            return Err(anyhow!("unexpected `rustc --print` output: {printed:?}"));
+        };
+        let host = host.trim().to_owned();
+        Ok(Self {
+            objcopy: Path::new(sysroot.trim())
+                .join("lib/rustlib")
+                .join(&host)
+                .join("bin")
+                .join(exe("llvm-objcopy")),
+            rustfmt: bin.join(exe("rustfmt")),
+            rustc,
+            cargo,
+            host,
+        })
+    }
+}
+
+pub fn command(toolchain: &Toolchain, program: impl AsRef<Path>) -> Command {
+    let mut command = Command::new(program.as_ref());
+    let bin = toolchain
+        .cargo
+        .parent()
+        .expect("toolchain cargo has a parent")
+        .to_path_buf();
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let path = env::var_os("PATH")
+        .map(|old| {
+            format!(
+                "{}{separator}{}",
+                bin.display(),
+                PathBuf::from(old).display()
+            )
+        })
+        .unwrap_or_else(|| bin.display().to_string());
+    command
+        .env("PATH", path)
+        .env("RUSTC", &toolchain.rustc)
+        .env("RUSTFMT", &toolchain.rustfmt)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_TARGET_DIR");
+    command
 }
