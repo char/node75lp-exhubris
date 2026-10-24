@@ -1,0 +1,49 @@
+only build the crates we care about
+
+since we don't need all of Oxide's firmware tree we can skip a
+bunch of porting work if we just don't include those crates
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 80a83aaf7af80f7a00d53f121173ffcdaff84087..e3884ecd1b6e2d889f78d87b0ca877d5aa62723a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,12 +1,16 @@
+ [workspace]
+ members = [
+-    "build/*",
+-    "sys/*",
+-    "lib/*",
+-    "app/*",
+-    "task/*",
+-    "drv/*",
+-    "test/*",
++    "build/call_rustfmt",
++    "build/kconfig",
++    "build/phash-gen",
++    "build/util",
++    "lib/armv8-m-mpu",
++    "lib/phash",
++    "lib/toml-task",
++    "lib/unwrap-lite",
++    "sys/abi",
++    "sys/kern",
++    "sys/kerncore",
+ ]
+ default-members = []
+ resolver = "2"
+@@ -20,15 +24,6 @@ opt-level = "z" # smaller optimizations
+ [profile.dev]
+ opt-level = 1 # no optimizations was just too painful in terms of flash size
+ 
+-[patch."https://github.com/oxidecomputer/hubris".userlib]
+-path = "sys/userlib"
+-
+-[patch."https://github.com/oxidecomputer/hubris".abi]
+-path = "sys/abi"
+-
+-[patch."https://github.com/oxidecomputer/hubris".counters]
+-path = "lib/counters"
+-
+ [workspace.dependencies]
+ anyhow = { version = "1.0.31", default-features = false, features = ["std"] }
+ array-init = { version = "2.1.0" }
