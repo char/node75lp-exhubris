@@ -1,0 +1,29 @@
+use architecture-agnostic alternatives in sys/kern
+
+should behave the same on ARM afaict
+
+diff --git a/sys/kern/src/fail.rs b/sys/kern/src/fail.rs
+index e4ba68cfe14514e77b1afa55628b6e04afbcb4e8..21f9eb5133858d5f5727cc7649b9f0973c7ee270 100644
+--- a/sys/kern/src/fail.rs
++++ b/sys/kern/src/fail.rs
+@@ -117,6 +117,6 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+         KERNEL_HAS_FAILED = true;
+     }
+     loop {
+-        cortex_m::asm::nop();
++        core::hint::spin_loop();
+     }
+ }
+diff --git a/sys/kern/src/umem.rs b/sys/kern/src/umem.rs
+index 318cfd386a2c0aeea0ed26b51177e56bef3ac43a..a1226b752396cf4bf7a753d3e02bdf513e0043af 100644
+--- a/sys/kern/src/umem.rs
++++ b/sys/kern/src/umem.rs
+@@ -62,7 +62,7 @@ impl<T> USlice<T> {
+         // second way to construct a USlice.
+ 
+         // ZST check, should resolve at compile time:
+-        uassert!(core::mem::size_of::<T>() != 0);
++        assert!(core::mem::size_of::<T>() != 0, "USlice<T> must not contain a ZST!");
+ 
+         // Alignment check:
+         if base_address % core::mem::align_of::<T>() != 0 {
