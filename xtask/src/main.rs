@@ -1,4 +1,5 @@
 mod build;
+mod test;
 mod upstream;
 
 use std::{
@@ -29,6 +30,8 @@ enum Cmd {
     CleanUpstreams,
     /// Build a raw .bin (never accesses hardware)
     Build,
+    /// Build the firmware image and run the host/upstream test suites
+    Test,
 }
 
 fn main() -> ExitCode {
@@ -67,6 +70,11 @@ fn run() -> Result<()> {
         Cmd::Build => {
             let toolchain = Toolchain::find()?;
             build::build(&root, &toolchain)?;
+        }
+        Cmd::Test => {
+            let toolchain = Toolchain::find()?;
+            build::build(&root, &toolchain)?;
+            test::test(&root, &toolchain)?;
         }
     }
     Ok(())
