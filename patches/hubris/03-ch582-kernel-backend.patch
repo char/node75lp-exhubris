@@ -1,0 +1,716 @@
+add a kernel backend for CH582
+
+- since there are only 4 PMP entries per task we do one null region, one flash, one RAM, and one peripheral region
+- we don't get per-peripheral isolation which is kinda sketchy but we'll see how it goes
+  
+diff --git a/sys/kern/Cargo.toml b/sys/kern/Cargo.toml
+index 00460d667a56365e3e1452d6f1273df9f3c66f56..8f4eedc4e713a8b7e0458fbb89b09a68897c227f 100644
+--- a/sys/kern/Cargo.toml
++++ b/sys/kern/Cargo.toml
+@@ -7,17 +7,19 @@ edition = "2021"
+ bitflags = { workspace = true }
+ byteorder = { workspace = true }
+ cfg-if = { workspace = true }
+-cortex-m = { workspace = true }
+ serde = { workspace = true }
+ ssmarshal = { workspace = true }
+ zerocopy = { workspace = true }
+ 
+ abi = { path = "../abi" }
+-armv8-m-mpu = { path = "../../lib/armv8-m-mpu" }
+ phash = { path = "../../lib/phash" }
+ unwrap-lite = { path = "../../lib/unwrap-lite" }
+ kerncore.path = "../kerncore"
+ 
++[target.'cfg(target_arch = "arm")'.dependencies]
++cortex-m = { workspace = true }
++armv8-m-mpu = { path = "../../lib/armv8-m-mpu" }
++
+ [build-dependencies]
+ anyhow = { workspace = true }
+ indexmap = { workspace = true }
+@@ -34,6 +36,7 @@ call_rustfmt = { path = "../../build/call_rustfmt" }
+ phash-gen = { path = "../../build/phash-gen" }
+ 
+ [features]
++ch582 = []
+ dump = []
+ nano = []
+ stack-watermark = []
+diff --git a/sys/kern/build.rs b/sys/kern/build.rs
+index c64adce147b7276610c4dcbf211e81d0e59197c4..4a849767f97ff20f8fd2e3d0f2405f1a3311de19 100644
+--- a/sys/kern/build.rs
++++ b/sys/kern/build.rs
+@@ -15,7 +15,16 @@ use indexmap::IndexMap;
+ use proc_macro2::TokenStream;
+ 
+ fn main() -> Result<()> {
+-    build_util::expose_m_profile()?;
++    if cfg!(feature = "ch582") {
++        if build_util::target() != "riscv32imac-unknown-none-elf" {
++            bail!("the CH582 backend requires riscv32imac-unknown-none-elf");
++        }
++        for profile in ["armv6m", "armv7m", "armv8m"] {
++            println!("cargo:rustc-check-cfg=cfg({profile})");
++        }
++    } else {
++        build_util::expose_m_profile()?;
++    }
+ 
+     println!("cargo::rustc-check-cfg=cfg(hubris_phantom_svc_mitigation)");
+     if build_util::target().starts_with("thumbv6m") {
+@@ -60,6 +69,10 @@ fn process_config() -> Result<Generated> {
+         ron::de::from_str(&build_util::env_var("HUBRIS_KCONFIG")?)
+             .context("parsing kconfig from HUBRIS_KCONFIG")?;
+ 
++    if cfg!(feature = "ch582") && !kconfig.irqs.is_empty() {
++        bail!("CH582 external IRQ routing is not implemented");
++    }
++
+     // The kconfig data structure keeps things somewhat abstract to give us, the
+     // kernel, more freedom about our internal implementation choices. However,
+     // this means we have to do some preprocessing before it's useful.
+@@ -154,10 +167,11 @@ fn process_config() -> Result<Generated> {
+             );
+         }
+ 
+-        if regions.len() > 8 {
++        let region_limit = if cfg!(feature = "ch582") { 4 } else { 8 };
++        if regions.len() > region_limit {
+             bail!("too many regions ({}) for task {i}", regions.len());
+         }
+-        regions.resize(8, 0usize);
++        regions.resize(region_limit, 0usize);
+ 
+         // Order the task's regions in ascending address order.
+         //
+@@ -258,6 +272,7 @@ fn process_config() -> Result<Generated> {
+     } else if target.starts_with("thumbv7m")
+         || target.starts_with("thumbv7em")
+         || target.starts_with("thumbv8m")
++        || (cfg!(feature = "ch582") && target == "riscv32imac-unknown-none-elf")
+     {
+         // First, try to build it as a single-level perfect hash map, which is
+         // cheaper but won't always succeed.
+diff --git a/sys/kern/src/arch.rs b/sys/kern/src/arch.rs
+index cfb1db78cc6f5827c757834d99e6b12505afdb12..5e5e0c4c0117608c19587e24acec9021e4521190 100644
+--- a/sys/kern/src/arch.rs
++++ b/sys/kern/src/arch.rs
+@@ -25,6 +25,9 @@ cfg_if::cfg_if! {
+         #[macro_use]
+         pub mod arm_m;
+         pub use arm_m::*;
++    } else if #[cfg(all(target_arch = "riscv32", feature = "ch582"))] {
++        pub mod ch582;
++        pub use ch582::*;
+     } else {
+         compile_error!("support for this architecture not implemented");
+     }
+diff --git a/sys/kern/src/arch/ch582.rs b/sys/kern/src/arch/ch582.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..7edc159e03a4362e817ce2682ff024f2d637dc0f
+--- /dev/null
++++ b/sys/kern/src/arch/ch582.rs
+@@ -0,0 +1,333 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++//! CH582 QingKe V4A bootstrap: cooperative scheduling, no external interrupts.
++//! Timers are polled at kernel entry; a task that never traps cannot be preempted.
++
++use crate::{
++    atomic::AtomicExt,
++    descs::RegionAttributes,
++    startup::with_task_table,
++    task::{self, ArchState, Task},
++    time::Timestamp,
++};
++use abi::{FaultInfo, FaultSource, InterruptNum, IrqStatus, UsageError};
++use core::{
++    arch::{asm, global_asm},
++    ptr::read_volatile,
++    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
++};
++
++mod pmp;
++pub use pmp::Region as RegionDescExt;
++
++#[repr(C)]
++#[derive(Debug, Default)]
++pub struct SavedState {
++    x: [u32; 32],
++    pc: u32,
++    status: u32,
++}
++
++const _: () = assert!(core::mem::offset_of!(SavedState, pc) == 128);
++const _: () = assert!(core::mem::offset_of!(SavedState, status) == 132);
++const _: () = assert!(core::mem::size_of::<SavedState>() == 136);
++
++global_asm!(include_str!("ch582/trap.S"));
++
++impl ArchState for SavedState {
++    fn stack_pointer(&self) -> u32 {
++        self.x[2]
++    }
++    fn arg0(&self) -> u32 {
++        self.x[10]
++    }
++    fn arg1(&self) -> u32 {
++        self.x[11]
++    }
++    fn arg2(&self) -> u32 {
++        self.x[12]
++    }
++    fn arg3(&self) -> u32 {
++        self.x[13]
++    }
++    fn arg4(&self) -> u32 {
++        self.x[14]
++    }
++    fn arg5(&self) -> u32 {
++        self.x[15]
++    }
++    fn arg6(&self) -> u32 {
++        self.x[16]
++    }
++    fn syscall_descriptor(&self) -> u32 {
++        self.x[17]
++    }
++    fn ret0(&mut self, value: u32) {
++        self.x[10] = value;
++    }
++    fn ret1(&mut self, value: u32) {
++        self.x[11] = value;
++    }
++    fn ret2(&mut self, value: u32) {
++        self.x[12] = value;
++    }
++    fn ret3(&mut self, value: u32) {
++        self.x[13] = value;
++    }
++    fn ret4(&mut self, value: u32) {
++        self.x[14] = value;
++    }
++    fn ret5(&mut self, value: u32) {
++        self.x[15] = value;
++    }
++}
++
++impl AtomicExt for AtomicBool {
++    type Primitive = bool;
++    fn swap_polyfill(&self, value: bool, ordering: Ordering) -> bool {
++        self.swap(value, ordering)
++    }
++}
++
++#[no_mangle]
++static CURRENT_TASK_PTR: AtomicPtr<Task> =
++    AtomicPtr::new(core::ptr::null_mut());
++static CYCLES_PER_TICK: AtomicU32 = AtomicU32::new(0);
++
++pub(crate) unsafe fn set_clock_freq(divisor: u32) {
++    // Do not let inherited MPRV apply user mappings to kernel data accesses.
++    unsafe {
++        asm!("csrc mstatus, {mask}", mask = in(reg) 0x20008u32, options(nostack));
++    }
++    assert!(divisor != 0);
++    CYCLES_PER_TICK.store(divisor, Ordering::Relaxed);
++}
++
++pub fn now() -> Timestamp {
++    let cycles = unsafe {
++        loop {
++            let high = read_volatile(0xe000_f00c as *const u32);
++            let low = read_volatile(0xe000_f008 as *const u32);
++            if read_volatile(0xe000_f00c as *const u32) == high {
++                break (u64::from(high) << 32) | u64::from(low);
++            }
++        }
++    };
++    Timestamp::from(cycles / u64::from(CYCLES_PER_TICK.load(Ordering::Relaxed)))
++}
++
++pub fn reinitialize(task: &mut Task) {
++    let descriptor = task.descriptor();
++    let entry = descriptor.entry_point;
++    let stack = descriptor.initial_stack;
++    assert!(entry & 1 == 0);
++    assert!(stack >= 16 && stack & 15 == 0);
++    assert!(task
++        .region_table()
++        .iter()
++        .any(|r| r.attributes.contains(RegionAttributes::EXECUTE)
++            && r.contains(entry as usize)));
++    assert!(task.region_table().iter().any(|r| r
++        .attributes
++        .contains(RegionAttributes::READ | RegionAttributes::WRITE)
++        && !r
++            .attributes
++            .intersects(RegionAttributes::DEVICE | RegionAttributes::DMA)
++        && r.contains((stack - 16) as usize)
++        && r.contains((stack - 1) as usize)));
++    let saved = task.save_mut();
++    *saved = SavedState::default();
++    saved.x[1] = u32::MAX;
++    saved.x[2] = stack;
++    saved.pc = entry;
++}
++
++pub const fn compute_region_extension_data(
++    base: u32,
++    size: u32,
++    attributes: RegionAttributes,
++) -> RegionDescExt {
++    assert!(attributes.bits() & RegionAttributes::RESERVED.bits() == 0);
++    let permissions = (attributes.bits() & 7) as u8;
++    let end = match base.checked_add(size) {
++        Some(end) => end,
++        None => panic!("CH582 region overflow"),
++    };
++    assert!(
++        permissions == 0
++            || (base >= 0x13000 && end <= 0x58af0)
++            || (base >= 0x20000000 && end <= 0x20008000)
++            || (attributes.contains(RegionAttributes::DEVICE)
++                && base >= 0x40000000
++                && end <= 0x40010000)
++    );
++    match pmp::encode(base, size, permissions) {
++        Ok(region) => region,
++        Err(_) => panic!("invalid CH582 PMP region"),
++    }
++}
++
++pub fn apply_memory_protection(task: &Task) {
++    let mut addresses = [0; 4];
++    let mut config = 0u32;
++    for (i, region) in task.region_table().iter().enumerate() {
++        let encoded = compute_region_extension_data(
++            region.base,
++            region.size,
++            region.attributes,
++        );
++        assert_eq!(encoded, region.arch_data);
++        addresses[i] = encoded.address;
++        config |= u32::from(encoded.config) << (i * 8);
++    }
++    unsafe {
++        let old: u32;
++        asm!("csrr {old}, pmpcfg0", old = out(reg) old, options(nostack));
++        assert_eq!(old & 0x80808080, 0, "inherited locked PMP entries");
++        asm!(
++            "csrw pmpcfg0, zero",
++            "csrw pmpaddr0, {a0}", "csrw pmpaddr1, {a1}",
++            "csrw pmpaddr2, {a2}", "csrw pmpaddr3, {a3}",
++            "csrw pmpcfg0, {config}",
++            "fence.i",
++            a0 = in(reg) addresses[0], a1 = in(reg) addresses[1],
++            a2 = in(reg) addresses[2], a3 = in(reg) addresses[3],
++            config = in(reg) config, options(nostack),
++        );
++        let (actual, a0, a1, a2, a3): (u32, u32, u32, u32, u32);
++        asm!(
++            "csrr {config}, pmpcfg0",
++            "csrr {a0}, pmpaddr0", "csrr {a1}, pmpaddr1",
++            "csrr {a2}, pmpaddr2", "csrr {a3}, pmpaddr3",
++            config = out(reg) actual, a0 = out(reg) a0, a1 = out(reg) a1,
++            a2 = out(reg) a2, a3 = out(reg) a3, options(nostack),
++        );
++        assert_eq!(actual, config, "PMP configuration readback");
++        assert_eq!([a0, a1, a2, a3], addresses, "PMP address readback");
++    }
++}
++
++/// `task` must belong to the initialized task table and outlive its next trap.
++pub unsafe fn set_current_task(task: &Task) {
++    CURRENT_TASK_PTR.store(
++        crate::startup::task_pointer(usize::from(task.descriptor().index)),
++        Ordering::Relaxed,
++    );
++    crate::profiling::event_context_switch(usize::from(
++        task.descriptor().index,
++    ));
++}
++
++pub fn start_first_task(_: u32, task: &Task) -> ! {
++    unsafe extern "C" {
++        fn ch582_trap_entry();
++        fn ch582_restore(state: *const SavedState) -> !;
++    }
++    unsafe {
++        let entry = ch582_trap_entry as *const () as usize;
++        let actual: usize;
++        // mscratch is zero in the kernel; a nested trap must never use a task stack.
++        asm!(
++            "csrci mstatus, 8", "csrw mscratch, zero",
++            "csrw 0x804, zero", "csrw mtvec, {entry}",
++            "csrr {actual}, mtvec",
++            entry = in(reg) entry, actual = out(reg) actual,
++            options(nostack),
++        );
++        assert_eq!(actual, entry, "direct trap vector readback");
++        set_current_task(task);
++        ch582_restore(CURRENT_TASK_PTR.load(Ordering::Relaxed).cast())
++    }
++}
++
++#[no_mangle]
++unsafe extern "C" fn ch582_handle_trap(current: *mut Task) -> *mut Task {
++    let (cause, value): (u32, u32);
++    unsafe {
++        asm!("csrr {cause}, mcause", "csrr {value}, mtval",
++        cause = out(reg) cause, value = out(reg) value, options(nostack));
++    }
++    assert_eq!(current, CURRENT_TASK_PTR.load(Ordering::Relaxed));
++    let (index, number) = {
++        let task = unsafe { &mut *current };
++        assert_eq!(task.save().status & 0x1800, 0, "machine-mode trap");
++        assert_eq!(cause & 0x80000000, 0, "unexpected CH582 interrupt");
++        task.update_stack_watermark();
++        (
++            usize::from(task.descriptor().index),
++            task.save().syscall_descriptor(),
++        )
++    };
++    if cause == 8 {
++        let saved = unsafe { &mut *current }.save_mut();
++        saved.pc = saved.pc.checked_add(4).expect("ECALL PC overflow");
++        with_task_table(|tasks| {
++            let _ = task::process_timers(tasks, now());
++        });
++        unsafe {
++            crate::syscalls::syscall_entry(number, current);
++        }
++        // Honor the dispatcher's choice among peers, but not over a higher-priority timer wakeup.
++        let previous = unsafe { &*CURRENT_TASK_PTR.load(Ordering::Relaxed) }
++            .descriptor()
++            .index;
++        with_task_table(|tasks| {
++            let next = task::select(usize::from(previous), tasks);
++            if next
++                .priority()
++                .is_more_important_than(tasks[usize::from(previous)].priority())
++            {
++                apply_memory_protection(next);
++                unsafe {
++                    set_current_task(next);
++                }
++            }
++        });
++    } else {
++        let fault = match cause {
++            0 | 1 | 4 | 5 | 6 | 7 => FaultInfo::MemoryAccess {
++                address: Some(value),
++                source: FaultSource::User,
++            },
++            2 => FaultInfo::IllegalInstruction,
++            _ => FaultInfo::InvalidOperation(cause),
++        };
++        with_task_table(|tasks| {
++            let next = match task::force_fault(tasks, index, fault) {
++                task::NextTask::Specific(i) => &tasks[i],
++                task::NextTask::Other => task::select(index, tasks),
++                task::NextTask::Same => {
++                    panic!("faulted task selected for return")
++                }
++            };
++            assert!(!core::ptr::eq(next, current));
++            apply_memory_protection(next);
++            unsafe {
++                set_current_task(next);
++            }
++        });
++    }
++    CURRENT_TASK_PTR.load(Ordering::Relaxed)
++}
++
++pub fn enable_irq(_: u32, _: bool) -> Result<(), UsageError> {
++    Err(UsageError::NoIrq)
++}
++pub fn disable_irq(_: u32, _: bool) -> Result<(), UsageError> {
++    Err(UsageError::NoIrq)
++}
++pub fn irq_status(_: u32) -> Result<IrqStatus, UsageError> {
++    Err(UsageError::NoIrq)
++}
++pub fn pend_software_irq(_: InterruptNum) -> Result<(), UsageError> {
++    Err(UsageError::NoIrq)
++}
++
++pub fn reset() -> ! {
++    unsafe extern "C" {
++        fn ch582_reset() -> !;
++    }
++    unsafe { ch582_reset() }
++}
+diff --git a/sys/kern/src/arch/ch582/pmp.rs b/sys/kern/src/arch/ch582/pmp.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6e15a639dff5e161f2265b53bbb0c46ab44a4ae
+--- /dev/null
++++ b/sys/kern/src/arch/ch582/pmp.rs
+@@ -0,0 +1,98 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#[derive(Copy, Clone, Debug, Eq, PartialEq)]
++pub struct Region {
++    pub address: u32,
++    pub config: u8,
++}
++
++#[derive(Copy, Clone, Debug, Eq, PartialEq)]
++pub enum InvalidRegion {
++    Size,
++    Alignment,
++    Overflow,
++    Permissions,
++}
++
++pub const fn encode(
++    base: u32,
++    size: u32,
++    permissions: u8,
++) -> Result<Region, InvalidRegion> {
++    if size < 4 || !size.is_power_of_two() {
++        return Err(InvalidRegion::Size);
++    }
++    if base & (size - 1) != 0 {
++        return Err(InvalidRegion::Alignment);
++    }
++    if base.checked_add(size).is_none() {
++        return Err(InvalidRegion::Overflow);
++    }
++    if permissions & !7 != 0 || permissions & 3 == 2 {
++        return Err(InvalidRegion::Permissions);
++    }
++    Ok(if size == 4 {
++        Region {
++            address: base >> 2,
++            config: 0x10 | permissions,
++        }
++    } else {
++        Region {
++            address: (base >> 2) | ((size >> 3) - 1),
++            config: 0x18 | permissions,
++        }
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn documented_na4_and_napot_encodings() {
++        assert_eq!(
++            encode(0x20000000, 4, 3),
++            Ok(Region {
++                address: 0x08000000,
++                config: 0x13
++            })
++        );
++        assert_eq!(
++            encode(0x20001000, 4096, 3),
++            Ok(Region {
++                address: 0x080005ff,
++                config: 0x1b
++            })
++        );
++        assert_eq!(
++            encode(0x14000, 1024, 5),
++            Ok(Region {
++                address: 0x507f,
++                config: 0x1d
++            })
++        );
++        assert_eq!(
++            encode(0, 32, 0),
++            Ok(Region {
++                address: 3,
++                config: 0x18
++            })
++        );
++    }
++
++    #[test]
++    fn rejects_unrepresentable_or_reserved_mappings() {
++        assert_eq!(encode(0, 0, 0), Err(InvalidRegion::Size));
++        assert_eq!(encode(0, 12, 3), Err(InvalidRegion::Size));
++        assert_eq!(encode(0x20000004, 8, 3), Err(InvalidRegion::Alignment));
++        assert_eq!(encode(0xfffffff8, 8, 1), Err(InvalidRegion::Overflow));
++        for permissions in [2, 6, 8, 0x80, 0xff] {
++            assert_eq!(
++                encode(0, 8, permissions),
++                Err(InvalidRegion::Permissions)
++            );
++        }
++    }
++}
+diff --git a/sys/kern/src/arch/ch582/trap.S b/sys/kern/src/arch/ch582/trap.S
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e5d2c6b537dd521c83f91c2ed1ba456ca176dc0
+--- /dev/null
++++ b/sys/kern/src/arch/ch582/trap.S
+@@ -0,0 +1,126 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++.section .text.ch582_trap, "ax", @progbits
++.balign 4
++.global ch582_trap_entry
++.type ch582_trap_entry,@function
++ch582_trap_entry:
++    csrrw t0, mscratch, t0
++    beqz t0, ch582_trap_fail
++    sw t1, 24(t0)
++    csrrw t1, mscratch, zero
++    sw t1, 20(t0)
++    sw x1, 4(t0)
++    sw x2, 8(t0)
++    sw x3, 12(t0)
++    sw x4, 16(t0)
++    sw x7, 28(t0)
++    sw x8, 32(t0)
++    sw x9, 36(t0)
++    sw x10, 40(t0)
++    sw x11, 44(t0)
++    sw x12, 48(t0)
++    sw x13, 52(t0)
++    sw x14, 56(t0)
++    sw x15, 60(t0)
++    sw x16, 64(t0)
++    sw x17, 68(t0)
++    sw x18, 72(t0)
++    sw x19, 76(t0)
++    sw x20, 80(t0)
++    sw x21, 84(t0)
++    sw x22, 88(t0)
++    sw x23, 92(t0)
++    sw x24, 96(t0)
++    sw x25, 100(t0)
++    sw x26, 104(t0)
++    sw x27, 108(t0)
++    sw x28, 112(t0)
++    sw x29, 116(t0)
++    sw x30, 120(t0)
++    sw x31, 124(t0)
++    csrr t1, mepc
++    sw t1, 128(t0)
++    csrr t1, mstatus
++    sw t1, 132(t0)
++.option push
++.option norelax
++    la sp, _stack_top
++    la gp, __global_pointer$
++.option pop
++    li tp, 0
++    mv a0, t0
++    call ch582_handle_trap
++    j ch582_restore
++.size ch582_trap_entry, .-ch582_trap_entry
++
++.global ch582_restore
++.type ch582_restore,@function
++ch582_restore:
++    mv t0, a0
++    lw t1, 128(t0)
++    csrw mepc, t1
++    /* U-mode, MPRV off, interrupts off: this backend is cooperative. */
++    csrw mstatus, zero
++    csrw mscratch, t0
++    lw x1, 4(t0)
++    lw x2, 8(t0)
++    lw x3, 12(t0)
++    lw x4, 16(t0)
++    lw x6, 24(t0)
++    lw x7, 28(t0)
++    lw x8, 32(t0)
++    lw x9, 36(t0)
++    lw x10, 40(t0)
++    lw x11, 44(t0)
++    lw x12, 48(t0)
++    lw x13, 52(t0)
++    lw x14, 56(t0)
++    lw x15, 60(t0)
++    lw x16, 64(t0)
++    lw x17, 68(t0)
++    lw x18, 72(t0)
++    lw x19, 76(t0)
++    lw x20, 80(t0)
++    lw x21, 84(t0)
++    lw x22, 88(t0)
++    lw x23, 92(t0)
++    lw x24, 96(t0)
++    lw x25, 100(t0)
++    lw x26, 104(t0)
++    lw x27, 108(t0)
++    lw x28, 112(t0)
++    lw x29, 116(t0)
++    lw x30, 120(t0)
++    lw x31, 124(t0)
++    lw t0, 20(t0)
++    mret
++.size ch582_restore, .-ch582_restore
++
++.global ch582_trap_fail
++ch582_trap_fail:
++    csrci mstatus, 8
++    j ch582_trap_fail
++
++.section .ramtext.kernel_reset, "ax", @progbits
++.balign 4
++.global ch582_reset
++.type ch582_reset,@function
++ch582_reset:
++    csrci mstatus, 8
++    li t0, 0x40001040
++    li t1, 0x57
++    li t2, 0xa8
++    sb t1, 0(t0)
++    sb t2, 0(t0)
++    nop
++    nop
++    lbu t1, 6(t0)
++    ori t1, t1, 1
++    sb t1, 6(t0)
++    sb zero, 0(t0)
++1:
++    j 1b
++.size ch582_reset, .-ch582_reset
+diff --git a/sys/kern/src/descs.rs b/sys/kern/src/descs.rs
+index 0a3edc3b3c5c5bbc3aaff5b0e8f879388325f2f6..6a1ae68740ce3718625c43239af8546932262ee8 100644
+--- a/sys/kern/src/descs.rs
++++ b/sys/kern/src/descs.rs
+@@ -4,6 +4,9 @@
+ 
+ //! Descriptor types, used to statically define application resources.
+ 
++#[cfg(feature = "ch582")]
++pub(crate) const REGIONS_PER_TASK: usize = 4;
++#[cfg(not(feature = "ch582"))]
+ pub(crate) const REGIONS_PER_TASK: usize = 8;
+ 
+ /// Indicates priority of a task.
+diff --git a/sys/kern/src/startup.rs b/sys/kern/src/startup.rs
+index 5f684d4c81ef470b23a6fb0e3ede0673d0fdc9bf..ada2bbfe013764a38d1fbd6cebf667b9c5977021 100644
+--- a/sys/kern/src/startup.rs
++++ b/sys/kern/src/startup.rs
+@@ -131,4 +131,14 @@ pub(crate) fn with_task_table<R>(body: impl FnOnce(&mut [Task]) -> R) -> R {
+     r
+ }
+ 
++/// Raw storage provenance, not a pointer derived from a shared task reference.
++/// Dereferencing requires an initialized table and no overlapping Rust borrow.
++#[cfg(feature = "ch582")]
++pub(crate) fn task_pointer(index: usize) -> *mut Task {
++    assert!(index < HUBRIS_TASK_COUNT);
++    core::ptr::addr_of_mut!(HUBRIS_TASK_TABLE_SPACE)
++        .cast::<Task>()
++        .wrapping_add(index)
++}
++
+ include!(concat!(env!("OUT_DIR"), "/kconfig.rs"));

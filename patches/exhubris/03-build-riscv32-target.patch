@@ -1,9 +1,91 @@
-add support for linking RV32 tasks to hubris-build
+add full RV32 / CH582 support to hubris-build
 
-- task startup/linking
-- elf tooling (untested)
-- kernel backend support (eight region table)
-
+diff --git a/files/kernel-ch582.x b/files/kernel-ch582.x
+new file mode 100644
+index 0000000000000000000000000000000000000000..2d08df8c0a0499135a9cc2ea88d5ab3065e953a3
+--- /dev/null
++++ b/files/kernel-ch582.x
+@@ -0,0 +1,80 @@
++OUTPUT_ARCH(riscv)
++ENTRY(_start)
++INCLUDE memory.x
++
++SECTIONS {
++    .init : {
++        KEEP(*(.init))
++    } > VECTORS
++
++    .vectors : {
++        _vectors_start = .;
++        KEEP(*(.vectors))
++        _vectors_end = .;
++    } > RECOVERY AT> VECTORS
++    _vectors_load = LOADADDR(.vectors);
++
++    .ramtext : ALIGN(4) {
++        _ramtext_start = .;
++        *(.ramtext .ramtext.*)
++        . = ALIGN(4);
++        _ramtext_end = .;
++    } > RECOVERY AT> VECTORS
++    _ramtext_load = LOADADDR(.ramtext);
++
++    .header : ALIGN(4) {
++        HEADER = .;
++        . += _HUBRIS_IMAGE_HEADER_SIZE;
++    } > VECTORS
++
++    .text : ALIGN(4) {
++        *(.text .text.*)
++        *(.rodata .rodata.*)
++        KEEP(*(.hubris_id))
++        . = ALIGN(4);
++    } > FLASH
++
++    .data : ALIGN(4) {
++        _data_start = .;
++        *(.sdata .sdata.* .data .data.*)
++        . = ALIGN(4);
++        _data_end = .;
++    } > RAM AT> FLASH
++    _data_load = LOADADDR(.data);
++    __global_pointer$ = _data_start + 0x800;
++
++    .bss (NOLOAD) : ALIGN(4) {
++        _bss_start = .;
++        *(.sbss .sbss.* .bss .bss.*)
++        *(COMMON)
++        . = ALIGN(4);
++        _bss_end = .;
++    } > RAM
++
++    .uninit (NOLOAD) : ALIGN(4) {
++        *(.uninit .uninit.*)
++        . = ALIGN(4);
++    } > RAM
++
++    .stack (NOLOAD) : ALIGN(16) {
++        _stack_bottom = .;
++        . = ORIGIN(STACK) + LENGTH(STACK);
++        _stack_top = .;
++    } > STACK
++
++    /DISCARD/ : { *(.eh_frame*) }
++}
++
++ASSERT(ORIGIN(VECTORS) == 0x13000, "application origin changed");
++ASSERT(SIZEOF(.init) == 4, "image must begin with a four-byte jump");
++ASSERT(LOADADDR(.vectors) == ORIGIN(VECTORS) + 4, "stock vector image offset changed");
++ASSERT(SIZEOF(.vectors) == 36 * 4, "unexpected vector count");
++ASSERT(ADDR(.vectors) == 0x20000000, "recovery vector base changed");
++ASSERT(_ramtext_end <= ORIGIN(RECOVERY) + LENGTH(RECOVERY), "recovery RAM overflow");
++ASSERT((_data_load & 3) == 0, "data load address must be word aligned");
++ASSERT((_ramtext_load & 3) == 0, "RAM code load address must be word aligned");
++ASSERT((_stack_top & 15) == 0, "kernel stack must be 16-byte aligned");
++ASSERT(ORIGIN(STACK) >= ORIGIN(RECOVERY) + LENGTH(RECOVERY), "stack overlaps recovery RAM");
++ASSERT(ORIGIN(RAM) >= _stack_top, "kernel RAM overlaps stack");
++ASSERT(ORIGIN(RAM) + LENGTH(RAM) <= 0x20008000, "RAM exceeds CH582 capacity");
++ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= 0x58AF0, "image exceeds conservative stock bound");
 diff --git a/files/task-link2-riscv.x b/files/task-link2-riscv.x
 new file mode 100644
 index 0000000000000000000000000000000000000000..6b7ebfd3538002b2003a957dfaee8da84d5894f4
@@ -383,7 +465,7 @@ index 9af46196ae5072288b179aea45656e6baebaa03d..50eaa82f41ffd152e9cad22a745401a0
  
              let mut outloc = targetroot.join(&plan.target_triple);
 diff --git a/tools/build/src/lib.rs b/tools/build/src/lib.rs
-index 30f8b332f7151a371d32b07a676f7c9c7cf1f2e7..352dd40f9690f2944fa34feb7f048e1355c0d32e 100644
+index 30f8b332f7151a371d32b07a676f7c9c7cf1f2e7..0158e2045eb5903c3b2a8e6bb84789c199d1b815 100644
 --- a/tools/build/src/lib.rs
 +++ b/tools/build/src/lib.rs
 @@ -12,7 +12,7 @@ pub mod kconfig;
@@ -510,24 +592,25 @@ index 30f8b332f7151a371d32b07a676f7c9c7cf1f2e7..352dd40f9690f2944fa34feb7f048e13
              region_count: 8 - 1,
          }),
          "thumbv8m.main-none-eabihf" => Some(TargetSpec {
-@@ -175,6 +191,16 @@ pub fn get_target_spec(triple: &str) -> Option<TargetSpec> {
+@@ -175,8 +191,17 @@ pub fn get_target_spec(triple: &str) -> Option<TargetSpec> {
              alloc_minimum: 32,
              stack_align: 8,
              bfd_name: "armelf".to_string(),
 +            linker_emulation: "armelf".to_string(),
-+            region_count: 8 - 1,
-+        }),
+             region_count: 8 - 1,
+         }),
 +        "riscv32imac-unknown-none-elf" => Some(TargetSpec {
 +            size_rule: SizeRule::PowerOfTwo,
 +            alloc_minimum: 8,
 +            stack_align: 16,
 +            bfd_name: "elf32-littleriscv".to_string(),
 +            linker_emulation: "elf32lriscv".to_string(),
-+            // Compile-only backend retains the legacy eight-region table.
-             region_count: 8 - 1,
-         }),
++            region_count: 4 - 1,
++        }),
          _ => None,
-@@ -204,3 +230,42 @@ pub fn cmd_with_clean_env(command: impl AsRef<OsStr>) -> Command {
+     }
+ }
+@@ -204,3 +229,42 @@ pub fn cmd_with_clean_env(command: impl AsRef<OsStr>) -> Command {
  
      cmd
  }
@@ -537,14 +620,14 @@ index 30f8b332f7151a371d32b07a676f7c9c7cf1f2e7..352dd40f9690f2944fa34feb7f048e13
 +    use super::*;
 +
 +    #[test]
-+    fn rv32_target_spec_matches_compile_only_backend() {
++    fn ch582_target_spec_matches_allocator_and_pmp_contract() {
 +        let spec = get_target_spec("riscv32imac-unknown-none-elf").unwrap();
 +        assert!(matches!(spec.size_rule, SizeRule::PowerOfTwo));
 +        assert_eq!(spec.alloc_minimum, 8);
 +        assert_eq!(spec.stack_align, 16);
 +        assert_eq!(spec.bfd_name, "elf32-littleriscv");
 +        assert_eq!(spec.linker_emulation, "elf32lriscv");
-+        assert_eq!(spec.region_count, 7);
++        assert_eq!(spec.region_count, 3);
 +        assert_eq!(spec.align_before_allocation(0x2000_0001), 0x2000_0008);
 +        assert_eq!(spec.align_for_allocation_size(0x2000_0001, 9), 0x2000_0010);
 +        assert_eq!(spec.round_allocation_size(9), 16);
@@ -571,7 +654,7 @@ index 30f8b332f7151a371d32b07a676f7c9c7cf1f2e7..352dd40f9690f2944fa34feb7f048e13
 +    }
 +}
 diff --git a/tools/build/src/main.rs b/tools/build/src/main.rs
-index 9becd69e5d213c0a909bf6a2eaaf5764a4b27ab1..ae64cc8d991fdd224e28a5c5b7e729af2cf010f3 100644
+index 9becd69e5d213c0a909bf6a2eaaf5764a4b27ab1..c417c6f45fcd19615f3a3c707b5281497350420f 100644
 --- a/tools/build/src/main.rs
 +++ b/tools/build/src/main.rs
 @@ -137,11 +137,17 @@ fn main() -> miette::Result<()> {
@@ -625,7 +708,7 @@ index 9becd69e5d213c0a909bf6a2eaaf5764a4b27ab1..ae64cc8d991fdd224e28a5c5b7e729af
              // Generate the kernel linker script on disk and hash it, too.
 -            let kernel_link_text = include_str!("../../../files/kernel-link.x");
 +            let kernel_link_text = if is_riscv {
-+                return Err(miette!("RV32 kernel linking requires a chip port"));
++                include_str!("../../../files/kernel-ch582.x")
 +            } else {
 +                include_str!("../../../files/kernel-link.x")
 +            };
