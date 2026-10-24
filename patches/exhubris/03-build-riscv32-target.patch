@@ -1,0 +1,655 @@
+add support for linking RV32 tasks to hubris-build
+
+- task startup/linking
+- elf tooling (untested)
+- kernel backend support (eight region table)
+
+diff --git a/files/task-link2-riscv.x b/files/task-link2-riscv.x
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b7ebfd3538002b2003a957dfaee8da84d5894f4
+--- /dev/null
++++ b/files/task-link2-riscv.x
+@@ -0,0 +1,112 @@
++/* Linker script for a temporary link operation, used to measure task size
++ * (but without flash fill) */
++INCLUDE memory.x
++
++OUTPUT_ARCH(riscv)
++ENTRY(_start);
++
++SECTIONS
++{
++  PROVIDE(_stack_start = ORIGIN(STACK) + LENGTH(STACK));
++
++  /* ### .text */
++  .text : {
++    _stext = .;
++    *(.text.start*); /* try and pull start symbol to beginning */
++    *(.text .text.*);
++    . = ALIGN(4);
++    __etext = .;
++  } > FLASH =0xdededede
++
++  /* ### .rodata */
++  .rodata : ALIGN(4)
++  {
++    *(.rodata .rodata.*);
++
++    /* 4-byte align the end (VMA) of this section.
++       This is required by LLD to ensure the LMA of the following .data
++       section will have the correct alignment. */
++    . = ALIGN(4);
++    __erodata = .;
++  } > FLASH
++
++  /*
++   * Sections in RAM
++   *
++   * NOTE: the userlib runtime assumes that these sections
++   * are 4-byte aligned and padded to 4-byte boundaries.
++   */
++  .data : ALIGN(4) {
++    . = ALIGN(4);
++    __sdata = .;
++    *(.sdata .sdata.*);
++    *(.data .data.*);
++    . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
++    __edata = .;
++    __global_pointer$ = __sdata + 0x800;
++  } > RAM AT>FLASH
++
++  /* LMA of .data */
++  __sidata = LOADADDR(.data);
++
++  .stack (NOLOAD) : ALIGN(4)
++  {
++    . += LENGTH(STACK);
++  } > STACK
++
++  .bss (NOLOAD) : ALIGN(4)
++  {
++    . = ALIGN(4);
++    __sbss = .;
++    *(.sbss .sbss.*);
++    *(.bss .bss.*);
++    . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
++    __ebss = .;
++  } > RAM
++
++  .uninit (NOLOAD) : ALIGN(4)
++  {
++    . = ALIGN(4);
++    *(.uninit .uninit.*);
++    . = ALIGN(4);
++    /* Place the heap right after `.uninit` */
++    __sheap = .;
++  } > RAM
++
++  /* ## .task_slot_table */
++  /* Table of TaskSlot instances and their names. Used to resolve task
++     dependencies during packaging. */
++  .task_slot_table (INFO) : {
++    . = .;
++    KEEP(*(.task_slot_table));
++  }
++
++  /* ## .caboose_pos_table */
++  /* Table of CaboosePos instances and their names. Used to record caboose
++     position during packaging. */
++  .caboose_pos_table (INFO) : {
++    . = .;
++    KEEP(*(.caboose_pos_table));
++  }
++
++  .hubris_abi_version (INFO) : {
++    . = .;
++    KEEP(*(.hubris_abi_version));
++  }
++
++  /* ## .idolatry */
++  .idolatry (INFO) : {
++    . = .;
++    KEEP(*(.idolatry));
++  }
++
++  /* ## Discarded sections */
++  /DISCARD/ :
++  {
++    /* Unused exception related info that only wastes space */
++    *(.ARM.exidx);
++    *(.ARM.exidx.*);
++    *(.ARM.extab.*);
++    *(.got .got.*);
++  }
++}
+diff --git a/files/task-link3-riscv.x b/files/task-link3-riscv.x
+new file mode 100644
+index 0000000000000000000000000000000000000000..62db94103b7b10c8b277adaad11c64db523be458
+--- /dev/null
++++ b/files/task-link3-riscv.x
+@@ -0,0 +1,117 @@
++/* Linker script for a temporary link operation, used to measure task size
++ * (but without flash fill) */
++INCLUDE memory.x
++
++OUTPUT_ARCH(riscv)
++ENTRY(_start);
++
++SECTIONS
++{
++  PROVIDE(_stack_start = ORIGIN(STACK) + LENGTH(STACK));
++
++  /* ### .text */
++  .text : {
++    _stext = .;
++    *(.text.start*); /* try and pull start symbol to beginning */
++    *(.text .text.*);
++    . = ALIGN(4);
++    __etext = .;
++  } > FLASH =0xdededede
++
++  /* ### .rodata */
++  .rodata : ALIGN(4)
++  {
++    *(.rodata .rodata.*);
++
++    /* 4-byte align the end (VMA) of this section.
++       This is required by LLD to ensure the LMA of the following .data
++       section will have the correct alignment. */
++    . = ALIGN(4);
++    __erodata = .;
++  } > FLASH
++
++  /*
++   * Sections in RAM
++   *
++   * NOTE: the userlib runtime assumes that these sections
++   * are 4-byte aligned and padded to 4-byte boundaries.
++   */
++  .data : ALIGN(4) {
++    . = ALIGN(4);
++    __sdata = .;
++    *(.sdata .sdata.*);
++    *(.data .data.*);
++    . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
++    __edata = .;
++    __global_pointer$ = __sdata + 0x800;
++  } > RAM AT>FLASH
++
++  /* LMA of .data */
++  __sidata = LOADADDR(.data);
++
++  .fill (LOADADDR(.data) + SIZEOF(.data)) : AT(LOADADDR(.data) + SIZEOF(.data))
++  {
++    . = ORIGIN(FLASH) + LENGTH(FLASH);
++  } >FLASH =0xffffffff
++
++  .stack (NOLOAD) : ALIGN(4)
++  {
++    . += LENGTH(STACK);
++  } > STACK
++
++  .bss (NOLOAD) : ALIGN(4)
++  {
++    . = ALIGN(4);
++    __sbss = .;
++    *(.sbss .sbss.*);
++    *(.bss .bss.*);
++    . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
++    __ebss = .;
++  } > RAM
++
++  .uninit (NOLOAD) : ALIGN(4)
++  {
++    . = ALIGN(4);
++    *(.uninit .uninit.*);
++    . = ALIGN(4);
++    /* Place the heap right after `.uninit` */
++    __sheap = .;
++  } > RAM
++
++  /* ## .task_slot_table */
++  /* Table of TaskSlot instances and their names. Used to resolve task
++     dependencies during packaging. */
++  .task_slot_table (INFO) : {
++    . = .;
++    KEEP(*(.task_slot_table));
++  }
++
++  /* ## .caboose_pos_table */
++  /* Table of CaboosePos instances and their names. Used to record caboose
++     position during packaging. */
++  .caboose_pos_table (INFO) : {
++    . = .;
++    KEEP(*(.caboose_pos_table));
++  }
++
++  .hubris_abi_version (INFO) : {
++    . = .;
++    KEEP(*(.hubris_abi_version));
++  }
++
++  /* ## .idolatry */
++  .idolatry (INFO) : {
++    . = .;
++    KEEP(*(.idolatry));
++  }
++
++  /* ## Discarded sections */
++  /DISCARD/ :
++  {
++    /* Unused exception related info that only wastes space */
++    *(.ARM.exidx);
++    *(.ARM.exidx.*);
++    *(.ARM.extab.*);
++    *(.got .got.*);
++  }
++}
+diff --git a/files/task-rlink-riscv.x b/files/task-rlink-riscv.x
+new file mode 100644
+index 0000000000000000000000000000000000000000..1318b9fb3152b528112302362112115573eeb04e
+--- /dev/null
++++ b/files/task-rlink-riscv.x
+@@ -0,0 +1,101 @@
++/* Linker script for a relocatable task
++ * This should be used with the `-r` linker flag */
++OUTPUT_ARCH(riscv)
++ENTRY(_start);
++
++SECTIONS
++{
++  /* ### .text */
++  .text : {
++    _stext = .;
++    *(.text.start*); /* try and pull start symbol to beginning */
++    *(.text .text.*);
++    . = ALIGN(4);
++    __etext = .;
++  }
++
++  /* ### .rodata */
++  .rodata : ALIGN(4)
++  {
++    *(.rodata .rodata.*);
++
++    /* 4-byte align the end (VMA) of this section.
++       This is required by LLD to ensure the LMA of the following .data
++       section will have the correct alignment. */
++    . = ALIGN(4);
++    __erodata = .;
++  }
++
++  /*
++   * Sections in RAM
++   *
++   * NOTE: the userlib runtime assumes that these sections
++   * are 4-byte aligned and padded to 4-byte boundaries.
++   */
++  .data : ALIGN(4) {
++    . = ALIGN(4);
++    __sdata = .;
++    *(.sdata .sdata.*);
++    *(.data .data.*);
++    . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
++    __edata = .;
++    __global_pointer$ = __sdata + 0x800;
++  }
++
++  /* LMA of .data */
++  __sidata = LOADADDR(.data);
++
++  .bss (NOLOAD) : ALIGN(4) {
++    . = ALIGN(4);
++    __sbss = .;
++    *(.sbss .sbss.*);
++    *(.bss .bss.*);
++    . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
++    __ebss = .;
++  }
++
++  .uninit (NOLOAD) : ALIGN(4) {
++    . = ALIGN(4);
++    *(.uninit .uninit.*);
++    . = ALIGN(4);
++    /* Place the heap right after `.uninit` */
++    __sheap = .;
++  }
++
++  /* ## .task_slot_table */
++  /* Table of TaskSlot instances and their names. Used to resolve task
++     dependencies during packaging. */
++  .task_slot_table (INFO) : {
++    . = .;
++    KEEP(*(.task_slot_table));
++  }
++
++  /* ## .caboose_pos_table */
++  /* Table of CaboosePos instances and their names. Used to record caboose
++     position during packaging. */
++  .caboose_pos_table (INFO) : {
++    . = .;
++    KEEP(*(.caboose_pos_table));
++  }
++
++  .hubris_abi_version (INFO) : {
++    . = .;
++    KEEP(*(.hubris_abi_version));
++  }
++
++  /* ## .idolatry */
++  .idolatry (INFO) : {
++    . = .;
++    KEEP(*(.idolatry));
++  }
++
++  /* ## Discarded sections */
++  /DISCARD/ :
++  {
++    /* Unused exception related info that only wastes space */
++    *(.ARM.exidx);
++    *(.ARM.exidx.*);
++    *(.ARM.extab.*);
++    *(.got .got.*);
++  }
++}
+diff --git a/tools/build/src/cargo.rs b/tools/build/src/cargo.rs
+index 9af46196ae5072288b179aea45656e6baebaa03d..50eaa82f41ffd152e9cad22a745401a03ce00097 100644
+--- a/tools/build/src/cargo.rs
++++ b/tools/build/src/cargo.rs
+@@ -13,6 +13,7 @@ pub enum LinkStyle {
+ #[allow(clippy::too_many_arguments)]
+ pub fn do_cargo_build(
+     linker_script_text: &str,
++    cargo_path: &Path,
+     plan: &BuildPlan,
+     link_style: LinkStyle,
+     targetroot: &Path,
+@@ -45,7 +46,7 @@ pub fn do_cargo_build(
+         crate::verbose::banner(format!("building component: {product_name}"));
+     }
+     
+-    let mut cmd = cmd_with_clean_env("cargo");
++    let mut cmd = cmd_with_clean_env(cargo_path);
+ 
+     if let Some(tc) = &plan.toolchain_override {
+         cmd.arg(format!("+{tc}"));
+@@ -68,7 +69,7 @@ pub fn do_cargo_build(
+ 
+     let product_path = match &plan.method {
+         BuildMethod::CargoWorkspaceBuild => {
+-            cmd.args(["build", "--release"]);
++            cmd.args(["build", "--release", "--locked"]);
+             cmd.args(["-p", &plan.package_name, "--bin", &plan.bin_name]);
+ 
+             let mut outloc = targetroot.join(&plan.target_triple);
+diff --git a/tools/build/src/lib.rs b/tools/build/src/lib.rs
+index 30f8b332f7151a371d32b07a676f7c9c7cf1f2e7..352dd40f9690f2944fa34feb7f048e1355c0d32e 100644
+--- a/tools/build/src/lib.rs
++++ b/tools/build/src/lib.rs
+@@ -12,7 +12,7 @@ pub mod kconfig;
+ use std::{ffi::OsStr, path::PathBuf, process::Command};
+ 
+ use cargo_metadata::Package;
+-use miette::{bail, miette, IntoDiagnostic as _};
++use miette::{miette, IntoDiagnostic as _};
+ use serde::Serialize;
+ 
+ #[derive(Clone, Debug, Serialize)]
+@@ -26,10 +26,14 @@ pub struct BuildEnv {
+     pub host_triple: String,
+     /// The location we have inferred for the linker.
+     pub linker_path: PathBuf,
++    /// Rust compiler executable from the active toolchain, not a rustup proxy.
++    pub rustc_path: PathBuf,
++    /// Cargo executable from the active toolchain, not a rustup proxy.
++    pub cargo_path: PathBuf,
+ }
+ 
+ pub fn determine_build_env() -> miette::Result<BuildEnv> {
+-    let sysroot = Command::new("rustc")
++    let sysroot = Command::new(executable_path(PathBuf::from("rustc")))
+         .args(["--print", "sysroot"])
+         .output().into_diagnostic()?;
+     if !sysroot.status.success() {
+@@ -37,7 +41,8 @@ pub fn determine_build_env() -> miette::Result<BuildEnv> {
+     }
+     let sysroot = PathBuf::from(std::str::from_utf8(&sysroot.stdout).into_diagnostic()?.trim());
+ 
+-    let host = Command::new(sysroot.join("bin").join("rustc"))
++    let rustc_path = executable_path(sysroot.join("bin").join("rustc"));
++    let host = Command::new(&rustc_path)
+         .arg("-vV")
+         .output().into_diagnostic()?;
+     if !host.status.success() {
+@@ -53,24 +58,23 @@ pub fn determine_build_env() -> miette::Result<BuildEnv> {
+         .ok_or_else(|| miette!("Could not get release from rustc"))?
+         .to_string();
+ 
+-    let mut linker_path = sysroot.clone();
+-    linker_path.extend([
+-        "lib",
+-        "rustlib",
+-        &host_triple,
+-        "bin",
+-        "gcc-ld",
+-        "ld.lld",
+-    ]);
+-    if !std::fs::exists(&linker_path).into_diagnostic()? {
+-        bail!("linker not available at: {}", linker_path.display());
+-    }
++    let rustlib_bin = sysroot.join("lib").join("rustlib").join(&host_triple).join("bin");
++    let linker_path = [
++        rustlib_bin.join("gcc-ld").join("ld.lld"),
++        rustlib_bin.join("rust-lld"),
++    ].into_iter()
++        .map(executable_path)
++        .find(|path| path.is_file())
++        .ok_or_else(|| miette!("linker not available in {}", rustlib_bin.display()))?;
+ 
++    let cargo_path = executable_path(sysroot.join("bin").join("cargo"));
+     Ok(BuildEnv {
+         release,
+         sysroot,
+         host_triple,
+         linker_path,
++        rustc_path,
++        cargo_path,
+     })
+ }
+ 
+@@ -105,6 +109,8 @@ pub struct TargetSpec {
+     pub stack_align: u64,
+     /// BFD architecture name.
+     pub bfd_name: String,
++    /// LLD emulation name used by the host linker.
++    pub linker_emulation: String,
+     /// Number of MPU regions available.
+     pub region_count: usize,
+ }
+@@ -117,9 +123,7 @@ impl TargetSpec {
+     pub fn align_for_allocation_size(&self, addr: u64, size: u64) -> u64 {
+         let size = u64::max(size, self.alloc_minimum);
+         match self.size_rule {
+-            SizeRule::PowerOfTwo => {
+-                addr.next_multiple_of(size)
+-            }
++            SizeRule::PowerOfTwo => addr.next_multiple_of(self.round_allocation_size(size)),
+             SizeRule::MultipleOf(n) => {
+                 addr.next_multiple_of(n)
+             }
+@@ -154,6 +158,16 @@ impl TargetSpec {
+     }
+ }
+ 
++fn executable_path(path: PathBuf) -> PathBuf {
++    if cfg!(windows) && path.extension() != Some(OsStr::new("exe")) {
++        let mut name = path.into_os_string();
++        name.push(".exe");
++        PathBuf::from(name)
++    } else {
++        path
++    }
++}
++
+ pub fn get_target_spec(triple: &str) -> Option<TargetSpec> {
+     match triple {
+         "thumbv6m-none-eabi" => Some(TargetSpec {
+@@ -161,6 +175,7 @@ pub fn get_target_spec(triple: &str) -> Option<TargetSpec> {
+             alloc_minimum: 32,
+             stack_align: 8,
+             bfd_name: "armelf".to_string(),
++            linker_emulation: "armelf".to_string(),
+             region_count: 8 - 1,
+         }),
+         "thumbv7em-none-eabihf" => Some(TargetSpec {
+@@ -168,6 +183,7 @@ pub fn get_target_spec(triple: &str) -> Option<TargetSpec> {
+             alloc_minimum: 32,
+             stack_align: 8,
+             bfd_name: "armelf".to_string(),
++            linker_emulation: "armelf".to_string(),
+             region_count: 8 - 1,
+         }),
+         "thumbv8m.main-none-eabihf" => Some(TargetSpec {
+@@ -175,6 +191,16 @@ pub fn get_target_spec(triple: &str) -> Option<TargetSpec> {
+             alloc_minimum: 32,
+             stack_align: 8,
+             bfd_name: "armelf".to_string(),
++            linker_emulation: "armelf".to_string(),
++            region_count: 8 - 1,
++        }),
++        "riscv32imac-unknown-none-elf" => Some(TargetSpec {
++            size_rule: SizeRule::PowerOfTwo,
++            alloc_minimum: 8,
++            stack_align: 16,
++            bfd_name: "elf32-littleriscv".to_string(),
++            linker_emulation: "elf32lriscv".to_string(),
++            // Compile-only backend retains the legacy eight-region table.
+             region_count: 8 - 1,
+         }),
+         _ => None,
+@@ -204,3 +230,42 @@ pub fn cmd_with_clean_env(command: impl AsRef<OsStr>) -> Command {
+ 
+     cmd
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn rv32_target_spec_matches_compile_only_backend() {
++        let spec = get_target_spec("riscv32imac-unknown-none-elf").unwrap();
++        assert!(matches!(spec.size_rule, SizeRule::PowerOfTwo));
++        assert_eq!(spec.alloc_minimum, 8);
++        assert_eq!(spec.stack_align, 16);
++        assert_eq!(spec.bfd_name, "elf32-littleriscv");
++        assert_eq!(spec.linker_emulation, "elf32lriscv");
++        assert_eq!(spec.region_count, 7);
++        assert_eq!(spec.align_before_allocation(0x2000_0001), 0x2000_0008);
++        assert_eq!(spec.align_for_allocation_size(0x2000_0001, 9), 0x2000_0010);
++        assert_eq!(spec.round_allocation_size(9), 16);
++        assert_eq!(spec.align_for_stack(0x2000_0001), 0x2000_0010);
++    }
++
++    #[test]
++    fn arm_target_spec_is_unchanged() {
++        let spec = get_target_spec("thumbv7em-none-eabihf").unwrap();
++        assert_eq!(spec.alloc_minimum, 32);
++        assert_eq!(spec.stack_align, 8);
++        assert_eq!(spec.bfd_name, "armelf");
++        assert_eq!(spec.linker_emulation, "armelf");
++        assert_eq!(spec.region_count, 7);
++    }
++
++    #[test]
++    fn windows_tool_paths_use_exe_names() {
++        if cfg!(windows) {
++            for (input, expected) in [("rust-lld", "rust-lld.exe"), ("ld.lld", "ld.lld.exe"), ("cargo.exe", "cargo.exe")] {
++                assert_eq!(executable_path(PathBuf::from(input)), PathBuf::from(expected));
++            }
++        }
++    }
++}
+diff --git a/tools/build/src/main.rs b/tools/build/src/main.rs
+index 9becd69e5d213c0a909bf6a2eaaf5764a4b27ab1..ae64cc8d991fdd224e28a5c5b7e729af2cf010f3 100644
+--- a/tools/build/src/main.rs
++++ b/tools/build/src/main.rs
+@@ -137,11 +137,17 @@ fn main() -> miette::Result<()> {
+             maybe_create_dir(&initial_build_dir).into_diagnostic()?;
+ 
+             // Run the initial build of each task using the task-rlink script.
+-            let task_rlink_text = include_str!("../../../files/task-rlink.x");
++            let is_riscv = app.board.chip.target_triple.value() == "riscv32imac-unknown-none-elf";
++            let task_rlink_text = if is_riscv {
++                include_str!("../../../files/task-rlink-riscv.x")
++            } else {
++                include_str!("../../../files/task-rlink.x")
++            };
+             buildid.eat(task_rlink_text.as_bytes());
+             for (name, plan) in &overall_plan.tasks {
+                 do_cargo_build(
+                     task_rlink_text,
++                    &env.cargo_path,
+                     plan,
+                     LinkStyle::Partial,
+                     &targetroot,
+@@ -159,7 +165,11 @@ fn main() -> miette::Result<()> {
+             banner("Task build complete, prelinking for size...");
+             let temp_link_dir = workdir.join("link2");
+             maybe_create_dir(&temp_link_dir).into_diagnostic()?;
+-            let task_link2_text = include_str!("../../../files/task-link2.x");
++            let task_link2_text = if is_riscv {
++                include_str!("../../../files/task-link2-riscv.x")
++            } else {
++                include_str!("../../../files/task-link2.x")
++            };
+             buildid.eat(task_link2_text.as_bytes());
+             std::fs::write(workdir.join("task-link2.x"), task_link2_text).into_diagnostic()?;
+ 
+@@ -207,7 +217,11 @@ fn main() -> miette::Result<()> {
+             }
+             maybe_create_dir(&dir3).into_diagnostic()?;
+ 
+-            let task_link3_text = include_str!("../../../files/task-link3.x");
++            let task_link3_text = if is_riscv {
++                include_str!("../../../files/task-link3-riscv.x")
++            } else {
++                include_str!("../../../files/task-link3.x")
++            };
+             buildid.eat(task_link3_text.as_bytes());
+             std::fs::write(workdir.join("task-link3.x"), task_link3_text).into_diagnostic()?;
+ 
+@@ -278,7 +292,11 @@ fn main() -> miette::Result<()> {
+             buildid.hash(&overall_plan);
+ 
+             // Generate the kernel linker script on disk and hash it, too.
+-            let kernel_link_text = include_str!("../../../files/kernel-link.x");
++            let kernel_link_text = if is_riscv {
++                return Err(miette!("RV32 kernel linking requires a chip port"));
++            } else {
++                include_str!("../../../files/kernel-link.x")
++            };
+             buildid.eat(kernel_link_text.as_bytes());
+             std::fs::write(workdir.join("kernel-link.x"), kernel_link_text).into_diagnostic()?;
+ 
+@@ -291,6 +309,7 @@ fn main() -> miette::Result<()> {
+             // Build the actual kernel.
+             do_cargo_build(
+                 kernel_link_text,
++                &env.cargo_path,
+                 &overall_plan.kernel,
+                 LinkStyle::Full,
+                 &targetroot,
+diff --git a/tools/build/src/relink.rs b/tools/build/src/relink.rs
+index 086807aed0ea1f615c4cc02e3daeef2e218b2bab..a74f7c847df4b41e0412c779a4911e10be283e2e 100644
+--- a/tools/build/src/relink.rs
++++ b/tools/build/src/relink.rs
+@@ -155,7 +155,7 @@ fn relink(
+     ldcmd.arg("-o").arg(outpath);
+     ldcmd.arg(format!("-T{}", linker_script.display()));
+     ldcmd.arg("--gc-sections");
+-    ldcmd.args(["-m", &target.bfd_name]);
++    ldcmd.args(["-m", &target.linker_emulation]);
+ 
+     // TODO: are these still necessary?
+     ldcmd.args(["-z", "common-page-size=0x20"]);
