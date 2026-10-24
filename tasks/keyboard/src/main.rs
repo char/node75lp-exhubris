@@ -6,7 +6,6 @@ use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use node75_keyboard_core::Debouncer;
 use node75_usb::{Action, Device};
 
-mod layout;
 mod usb_hw;
 
 mod board {
@@ -45,6 +44,7 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
     let mut device = Device::default();
     device.set_telemetry(telemetry);
     let mut debounce = Debouncer::default();
+    let mut keymap = node75_keymap::Keymap::new();
     let mut last_scan = clock.millis();
     let mut keys = [0; 6];
     loop {
@@ -87,7 +87,19 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
             let raw = unsafe { node75_matrix::sample() };
             now = clock.millis();
             keys = debounce.update(raw, now);
-            device.set_report(layout::report(keys));
+            // Flush on every change so a tapped tap-hold key's press is
+            // transmitted before its release replaces it.
+            keymap.update(keys, now, |resolved| {
+                device.set_report(node75_keyboard_core::report(
+                    resolved.modifiers,
+                    resolved.usages(),
+                ));
+                if let Some(report) = device.report_due(now)
+                    && hardware.transmit(1, &report)
+                {
+                    device.report_queued(report);
+                }
+            });
             last_scan = now;
         }
         if let Some(report) = device.report_due(now)

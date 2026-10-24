@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+node75-keymap = { path = "../../lib/keymap" }
 node75-keyboard-core = { path = "../../lib/keyboard-core" }
 node75-matrix = { path = "../../lib/matrix" }
 node75-usb = { path = "../../lib/usb" }
