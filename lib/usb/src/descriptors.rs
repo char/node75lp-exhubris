@@ -55,6 +55,7 @@ const fn hid(report_descriptor_len: usize) -> [u8; 9] {
 }
 
 pub const KEYBOARD_HID: [u8; 9] = hid(hid::KEYBOARD.len());
+pub const CONSUMER_HID: [u8; 9] = hid(hid::CONSUMER.len());
 
 const INTERFACE_LEN: usize = 9 + 9 + 7;
 
@@ -67,6 +68,7 @@ const fn interface(interface: Interface) -> [u8; INTERFACE_LEN] {
             KEYBOARD_HID,
             size_of::<Report>(),
         ),
+        Interface::Consumer => (0, 0, CONSUMER_HID, size_of::<u16>()),
     };
     let mut out = Bytes::new();
     out.extend(&[9, INTERFACE_TYPE, interface as u8, 0, 1]); // no alternate settings; one endpoint
@@ -78,15 +80,16 @@ const fn interface(interface: Interface) -> [u8; INTERFACE_LEN] {
     out.finish()
 }
 
-const CONFIGURATION_LEN: usize = 9 + INTERFACE_LEN;
+const CONFIGURATION_LEN: usize = 9 + 2 * INTERFACE_LEN;
 
 pub const CONFIGURATION: [u8; CONFIGURATION_LEN] = {
     let mut out = Bytes::new();
     out.extend(&[9, CONFIGURATION_TYPE]);
     out.extend(&(CONFIGURATION_LEN as u16).to_le_bytes());
-    out.extend(&[1, CONFIGURATION_VALUE, 0]); // interfaces; no string
+    out.extend(&[2, CONFIGURATION_VALUE, 0]); // interfaces; no string
     out.extend(&[BUS_POWERED, MAX_POWER_2MA]);
     out.extend(&interface(Interface::Keyboard));
+    out.extend(&interface(Interface::Consumer));
     out.finish()
 };
 

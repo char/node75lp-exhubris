@@ -82,7 +82,7 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
                 }
                 Action::Address(address) => hardware.set_address(address),
                 Action::Configure(configured) => hardware.configure(configured),
-                Action::Halt(halted) => hardware.set_halt(halted),
+                Action::Halt(endpoint, halted) => hardware.set_halt(endpoint, halted),
                 Action::Stall => hardware.stall_control(),
             }
             unsafe { write_volatile(addr_of_mut!(USB_LEDS), device.leds()) };
@@ -92,18 +92,11 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
             let raw = unsafe { node75_matrix::sample() };
             now = clock.millis();
             keys = debounce.update(raw, now);
-            // Flush on every change so a tapped tap-hold key's press is
-            // transmitted before its release replaces it.
             keymap.update(keys, now, |resolved| {
                 device.set_report(node75_keyboard_core::report(
                     resolved.modifiers,
                     resolved.usages(),
                 ));
-                if let Some(report) = device.report_due(now)
-                    && hardware.transmit(1, &report)
-                {
-                    device.report_queued(report);
-                }
             });
             last_scan = now;
         }
@@ -111,6 +104,11 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
             && hardware.transmit(1, &report)
         {
             device.report_queued(report);
+        }
+        if let Some(report) = device.consumer_due(now)
+            && hardware.transmit(2, &report)
+        {
+            device.consumer_queued(u16::from_le_bytes(report));
         }
         // GPIO and USB register transactions are complete before IPC can yield.
         observe(keys, now, device.active(), device.leds());

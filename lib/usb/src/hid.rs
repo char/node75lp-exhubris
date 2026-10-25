@@ -8,6 +8,7 @@ enum Page {
     GenericDesktop = 0x01,
     Keyboard = 0x07,
     Led = 0x08,
+    Consumer = 0x0c,
     Vendor = 0xff00,
 }
 
@@ -36,6 +37,7 @@ const VARIABLE: u8 = 1 << 1;
 const ARRAY: u8 = 0;
 
 const KEYBOARD_USAGE: u16 = 0x06;
+const CONSUMER_CONTROL: u16 = 0x01;
 const TELEMETRY: u16 = 0x01;
 
 const NO_EVENT: u16 = 0x00;
@@ -44,6 +46,7 @@ const LEFT_CONTROL: u16 = 0xe0;
 const RIGHT_GUI: u16 = 0xe7;
 const NUM_LOCK: u16 = 0x01;
 const KANA: u16 = 0x05;
+const LAST_CONSUMER_USAGE: u16 = 0x02a0;
 pub const TELEMETRY_BYTES: usize = 16;
 
 /// One output bit per LED from `NUM_LOCK` to `KANA`.
@@ -93,7 +96,23 @@ const KEYBOARD_ITEMS: &[Item] = &[
     EndCollection,
 ];
 
+/// One 16-bit consumer usage at a time; zero means nothing is pressed.
+const CONSUMER_ITEMS: &[Item] = &[
+    UsagePage(Page::Consumer),
+    Usage(CONSUMER_CONTROL),
+    Application,
+    LogicalMinimum(0),
+    LogicalMaximum(LAST_CONSUMER_USAGE as i32),
+    UsageMinimum(0),
+    UsageMaximum(LAST_CONSUMER_USAGE),
+    ReportSize(16),
+    ReportCount(1),
+    Input(ARRAY),
+    EndCollection,
+];
+
 pub const KEYBOARD: [u8; encoded_len(KEYBOARD_ITEMS)] = encode(KEYBOARD_ITEMS);
+pub const CONSUMER: [u8; encoded_len(CONSUMER_ITEMS)] = encode(CONSUMER_ITEMS);
 
 // Short item tags, before the data size is merged into the low two bits.
 const USAGE_PAGE: u8 = 0x04;

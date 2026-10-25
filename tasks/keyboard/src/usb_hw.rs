@@ -20,10 +20,13 @@ const UEP2_3_MOD: *mut u8 = (USB + 0x0d) as *mut u8;
 const UEP567_MOD: *mut u8 = (USB + 0x0e) as *mut u8;
 const UEP0_DMA: *mut u16 = (USB + 0x10) as *mut u16;
 const UEP1_DMA: *mut u16 = (USB + 0x14) as *mut u16;
+const UEP2_DMA: *mut u16 = (USB + 0x18) as *mut u16;
 const UEP0_T_LEN: *mut u8 = (USB + 0x20) as *mut u8;
 const UEP0_CTRL: *mut u8 = (USB + 0x22) as *mut u8;
 const UEP1_T_LEN: *mut u8 = (USB + 0x24) as *mut u8;
 const UEP1_CTRL: *mut u8 = (USB + 0x26) as *mut u8;
+const UEP2_T_LEN: *mut u8 = (USB + 0x28) as *mut u8;
+const UEP2_CTRL: *mut u8 = (USB + 0x2a) as *mut u8;
 
 const UC_DEV_PU_EN: u8 = 0x20;
 const UC_INT_BUSY: u8 = 0x08;
@@ -57,6 +60,7 @@ const UEP_T_STALL: u8 = 0x03;
 const UEP_AUTO_TOG: u8 = 0x10;
 const EP0_MAX: usize = 64;
 const EP1_MAX: usize = 8;
+const EP2_MAX: usize = 2;
 const UIF_EVENTS: u8 = UIF_BUS_RST | UIF_TRANSFER | UIF_SUSPEND;
 
 #[repr(align(4))]
@@ -64,6 +68,7 @@ struct DmaBuf([u8; 64]);
 
 static mut EP0_BUF: DmaBuf = DmaBuf([0; 64]);
 static mut EP1_BUF: DmaBuf = DmaBuf([0; 64]);
+static mut EP2_BUF: DmaBuf = DmaBuf([0; 64]);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -89,9 +94,12 @@ pub struct Usb {
     configured: bool,
     ep0_busy: bool,
     ep1_busy: bool,
+    ep2_busy: bool,
     ep1_halted: bool,
+    ep2_halted: bool,
     ep0_next_toggle: bool,
     ep1_next_toggle: bool,
+    ep2_next_toggle: bool,
     suspend_state: Option<bool>,
     held_flags: u8,
     ep0_response: Ep0Response,
@@ -120,10 +128,16 @@ impl Usb {
                 UEP1_DMA,
                 dma_addr(core::ptr::addr_of_mut!(EP1_BUF.0).cast::<u8>()),
             );
+            write_volatile(
+                UEP2_DMA,
+                dma_addr(core::ptr::addr_of_mut!(EP2_BUF.0).cast::<u8>()),
+            );
             write_volatile(USB_DEV_AD, 0);
             write_volatile(UEP0_CTRL, UEP_R_ACK | UEP_T_NAK);
             write_volatile(UEP1_CTRL, UEP_R_ACK | UEP_T_NAK);
+            write_volatile(UEP2_CTRL, UEP_R_ACK | UEP_T_NAK);
             write_volatile(UEP4_1_MOD, 0x40); // EP1 IN only, one 64-byte buffer.
+            write_volatile(UEP2_3_MOD, 0x04); // EP2 IN only, one 64-byte buffer.
             write_volatile(USB_INT_FG, 0xff);
             write_volatile(USB_CTRL, UC_INT_BUSY | UC_DMA_EN);
             let disconnected_at = clock.millis();
@@ -138,9 +152,12 @@ impl Usb {
             configured: false,
             ep0_busy: false,
             ep1_busy: false,
+            ep2_busy: false,
             ep1_halted: false,
+            ep2_halted: false,
             ep0_next_toggle: true,
             ep1_next_toggle: false,
+            ep2_next_toggle: false,
             suspend_state: None,
             held_flags: 0,
             ep0_response: Ep0Response::None,
@@ -157,14 +174,19 @@ impl Usb {
                 write_volatile(USB_DEV_AD, 0);
                 write_volatile(UEP0_T_LEN, 0);
                 write_volatile(UEP1_T_LEN, 0);
+                write_volatile(UEP2_T_LEN, 0);
                 write_volatile(UEP0_CTRL, UEP_R_ACK | UEP_T_NAK);
                 write_volatile(UEP1_CTRL, UEP_R_ACK | UEP_T_NAK);
+                write_volatile(UEP2_CTRL, UEP_R_ACK | UEP_T_NAK);
                 self.configured = false;
                 self.ep0_busy = false;
                 self.ep1_busy = false;
+                self.ep2_busy = false;
                 self.ep1_halted = false;
+                self.ep2_halted = false;
                 self.ep0_next_toggle = true;
                 self.ep1_next_toggle = false;
+                self.ep2_next_toggle = false;
                 self.suspend_state = None;
                 self.held_flags = flags & UIF_EVENTS;
                 self.ep0_response = Ep0Response::None;
@@ -214,6 +236,21 @@ impl Usb {
             if flags & UIF_SUSPEND != 0 {
                 let suspended = read_volatile(USB_MIS_ST) & 0x04 != 0;
                 if self.suspend_state != Some(suspended) {
+                    if suspended {
+                        // Pending completions were retired above. Cancel unpolled
+                        // input without advancing either endpoint's data toggle.
+                        for (busy, control, length) in [
+                            (&mut self.ep1_busy, UEP1_CTRL, UEP1_T_LEN),
+                            (&mut self.ep2_busy, UEP2_CTRL, UEP2_T_LEN),
+                        ] {
+                            if *busy {
+                                let ctrl = read_volatile(control);
+                                write_volatile(control, (ctrl & !UEP_T_RES) | UEP_T_NAK);
+                                write_volatile(length, 0);
+                                *busy = false;
+                            }
+                        }
+                    }
                     self.suspend_state = Some(suspended);
                     self.held_flags = UIF_SUSPEND;
                     return Some(Event::Suspend(suspended));
@@ -239,6 +276,7 @@ impl Usb {
         let (busy, toggle, control) = match endpoint {
             0 => (&mut self.ep0_busy, &mut self.ep0_next_toggle, UEP0_CTRL),
             1 => (&mut self.ep1_busy, &mut self.ep1_next_toggle, UEP1_CTRL),
+            2 => (&mut self.ep2_busy, &mut self.ep2_next_toggle, UEP2_CTRL),
             _ => return None,
         };
         if !*busy {
@@ -319,6 +357,19 @@ impl Usb {
                     self.ep1_next_toggle,
                 )
             }
+            2 => {
+                if !self.configured || self.ep2_halted {
+                    return false;
+                }
+                (
+                    EP2_MAX,
+                    unsafe { core::ptr::addr_of_mut!(EP2_BUF.0).cast::<u8>() },
+                    UEP2_T_LEN,
+                    UEP2_CTRL,
+                    &mut self.ep2_busy,
+                    self.ep2_next_toggle,
+                )
+            }
             _ => return false,
         };
         if *busy || data.len() > capacity {
@@ -349,10 +400,14 @@ impl Usb {
     pub fn configure(&mut self, configured: bool) {
         self.configured = configured;
         self.ep1_busy = false;
+        self.ep2_busy = false;
         self.ep1_next_toggle = false;
+        self.ep2_next_toggle = false;
         self.ep1_halted = false;
+        self.ep2_halted = false;
         unsafe {
             write_volatile(UEP1_CTRL, UEP_R_ACK | UEP_T_NAK);
+            write_volatile(UEP2_CTRL, UEP_R_ACK | UEP_T_NAK);
         }
     }
 
@@ -363,19 +418,34 @@ impl Usb {
         }
     }
 
-    pub fn set_halt(&mut self, halted: bool) {
-        self.ep1_busy = false;
-        self.ep1_halted = halted;
-        self.ep1_next_toggle = false;
+    pub fn set_halt(&mut self, endpoint: u8, halted: bool) {
+        let (busy, halt, toggle, control) = match endpoint {
+            0x81 => (
+                &mut self.ep1_busy,
+                &mut self.ep1_halted,
+                &mut self.ep1_next_toggle,
+                UEP1_CTRL,
+            ),
+            0x82 => (
+                &mut self.ep2_busy,
+                &mut self.ep2_halted,
+                &mut self.ep2_next_toggle,
+                UEP2_CTRL,
+            ),
+            _ => return,
+        };
+        *busy = false;
+        *halt = halted;
+        *toggle = false;
         unsafe {
-            let mut ctrl = read_volatile(UEP1_CTRL)
+            let mut ctrl = read_volatile(control)
                 & !(UEP_R_RES | UEP_T_RES | UEP_R_TOG | UEP_T_TOG | UEP_AUTO_TOG);
             ctrl |= if halted {
                 UEP_R_STALL | UEP_T_STALL
             } else {
                 UEP_R_ACK | UEP_T_NAK
             };
-            write_volatile(UEP1_CTRL, ctrl);
+            write_volatile(control, ctrl);
         }
     }
 }

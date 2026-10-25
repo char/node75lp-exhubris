@@ -1,7 +1,8 @@
-//! USB HID keyboard device state machine: descriptors, control transfers,
-//! report scheduling. Independent of MMIO; the register driver is in the
-//! keyboard task. Report policy follows char/q65-max-hubris; 6KRO in both
-//! boot and report protocols.
+//! USB HID device state machine: a boot/report keyboard on interface 0
+//! (EP1) and a consumer-control interface on interface 1 (EP2) for media
+//! keys. Descriptors, control transfers, report scheduling. Independent
+//! of MMIO; the register driver is in the keyboard task. Keyboard report
+//! policy follows char/q65-max-hubris; 6KRO in both protocols.
 
 #![no_std]
 
@@ -13,10 +14,11 @@ mod descriptors;
 mod hid;
 
 use descriptors::{
-    CONFIGURATION, CONFIGURATION_TYPE, CONFIGURATION_VALUE, CONTROL_MAX_PACKET, DEVICE,
-    DEVICE_TYPE, HID_TYPE, KEYBOARD_HID, LANGUAGES, PRODUCT, PRODUCT_STRING, REPORT_TYPE,
+    CONFIGURATION, CONFIGURATION_TYPE, CONFIGURATION_VALUE, CONSUMER_HID, CONTROL_MAX_PACKET,
+    DEVICE, DEVICE_TYPE, HID_TYPE, KEYBOARD_HID, LANGUAGES, PRODUCT, PRODUCT_STRING, REPORT_TYPE,
     STRING_TYPE, US_ENGLISH,
 };
+use heapless::Deque;
 use hid::{LED_MASK, TELEMETRY_BYTES};
 
 /// A boot-protocol keyboard report: modifiers, a reserved byte and six key slots.
@@ -26,6 +28,7 @@ pub type Report = [u8; 8];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Interface {
     Keyboard,
+    Consumer,
 }
 
 impl Interface {
@@ -90,9 +93,11 @@ const FEATURE_REPORT: u16 = 0x0300;
 
 // wIndex for interface, endpoint and string requests.
 const KEYBOARD: u16 = Interface::Keyboard as u16;
+const CONSUMER: u16 = Interface::Consumer as u16;
 const CONTROL_OUT: u16 = 0x00;
 const CONTROL_IN: u16 = DIRECTION_IN as u16;
 const KEYBOARD_IN: u16 = Interface::Keyboard.endpoint_address() as u16;
+const CONSUMER_IN: u16 = Interface::Consumer.endpoint_address() as u16;
 const LANGUAGE: u16 = US_ENGLISH;
 
 const ENDPOINT_HALT: u16 = 0;
@@ -127,7 +132,8 @@ pub enum Action {
     Send(Packet),
     Address(u8),
     Configure(bool),
-    Halt(bool),
+    /// Endpoint address (0x81 or 0x82) and new halt state.
+    Halt(u8, bool),
     Stall,
 }
 
@@ -142,9 +148,10 @@ enum Protocol {
 enum Commit {
     Address(u8),
     Configuration(bool),
-    Halt(bool),
+    Halt(Interface, bool),
     Protocol(Protocol),
     Idle(u8),
+    ConsumerIdle(u8),
     Leds(u8),
 }
 
@@ -168,15 +175,23 @@ pub struct Device {
     address: u8,
     configured: bool,
     halted: bool,
+    ep2_halted: bool,
     suspended: bool,
     protocol: Protocol,
     idle: u8,
     leds: u8,
     report: Report,
+    pending: Deque<Report, 16>,
     telemetry: [u8; TELEMETRY_BYTES],
     in_flight: Option<Report>,
     acknowledged: Option<Report>,
     last_report_at: u32,
+    consumer: u16,
+    consumer_idle: u8,
+    consumer_last_report_at: u32,
+    consumer_in_flight: Option<u16>,
+    consumer_acknowledged: Option<u16>,
+    consumer_pending: Deque<u16, 16>,
 }
 
 impl Device {
@@ -190,8 +205,15 @@ impl Device {
 
     pub fn set_suspended(&mut self, suspended: bool) {
         self.suspended = suspended;
-        if !suspended {
+        if suspended {
+            // The register driver disarms both interrupt endpoints as well.
+            self.in_flight = None;
+            self.pending.clear();
+            self.consumer_in_flight = None;
+            self.cancel_consumer();
+        } else {
             self.acknowledged = None;
+            self.consumer_acknowledged = None;
         }
     }
 
@@ -208,12 +230,23 @@ impl Device {
     }
 
     pub fn set_report(&mut self, report: Report) {
+        if report == self.report {
+            return;
+        }
         self.report = report;
+        if !self.active() || self.halted || self.pending.push_back(report).is_err() {
+            // On disconnect or overflow, converge to the current physical keys
+            // rather than replaying stale input or leaving a released key down.
+            self.pending.clear();
+        }
     }
 
     pub fn report_due(&self, now: u32) -> Option<Report> {
         if !self.configured || self.suspended || self.halted || self.in_flight.is_some() {
             return None;
+        }
+        if let Some(report) = self.pending.front() {
+            return Some(*report);
         }
         let changed = self.acknowledged != Some(self.report);
         let expired = self.idle != 0
@@ -223,7 +256,65 @@ impl Device {
 
     /// Call only once the controller accepts this exact snapshot into its DMA buffer.
     pub fn report_queued(&mut self, report: Report) {
+        if let Some(pending) = self.pending.pop_front() {
+            debug_assert_eq!(pending, report);
+        }
         self.in_flight = Some(report);
+    }
+
+    /// Preserve transitions until EP2 acknowledges them. On overflow or
+    /// disconnect, discard gestures and converge to all-up instead of
+    /// risking a stuck volume key. The producer must wait for a fresh touch.
+    pub fn enqueue_consumer(&mut self, usage: u16) -> bool {
+        if !self.active() || self.ep2_halted {
+            self.cancel_consumer();
+            return false;
+        }
+        if usage == self.consumer {
+            return true;
+        }
+        if self.consumer_pending.push_back(usage).is_err() {
+            self.cancel_consumer();
+            return false;
+        }
+        self.consumer = usage;
+        true
+    }
+
+    /// Discard pending gestures and release any usage already sent to the host.
+    pub fn cancel_consumer(&mut self) {
+        self.consumer = 0;
+        self.consumer_pending.clear();
+    }
+
+    pub fn consumer_due(&self, now: u32) -> Option<[u8; 2]> {
+        let expired = self.consumer_idle != 0
+            && now.wrapping_sub(self.consumer_last_report_at)
+                >= u32::from(self.consumer_idle) * IDLE_UNIT_MS;
+        if !self.configured
+            || self.suspended
+            || self.ep2_halted
+            || self.consumer_in_flight.is_some()
+            || (self.consumer_pending.is_empty()
+                && self.consumer_acknowledged == Some(self.consumer)
+                && !expired)
+        {
+            return None;
+        }
+        let usage = self
+            .consumer_pending
+            .front()
+            .copied()
+            .unwrap_or(self.consumer);
+        Some(usage.to_le_bytes())
+    }
+
+    /// Call only once the controller accepts this exact snapshot into its DMA buffer.
+    pub fn consumer_queued(&mut self, usage: u16) {
+        self.consumer_in_flight = Some(usage);
+        if let Some(pending) = self.consumer_pending.pop_front() {
+            debug_assert_eq!(pending, usage);
+        }
     }
 
     fn read(&mut self, bytes: &[u8], requested: u16) -> Action {
@@ -285,6 +376,12 @@ impl Device {
             (STANDARD_INTERFACE_IN, GET_DESCRIPTOR, REPORT_DESCRIPTOR, KEYBOARD, _) => {
                 self.read_descriptor(&hid::KEYBOARD, length)
             }
+            (STANDARD_INTERFACE_IN, GET_DESCRIPTOR, HID_DESCRIPTOR, CONSUMER, _) => {
+                self.read_descriptor(&CONSUMER_HID, length)
+            }
+            (STANDARD_INTERFACE_IN, GET_DESCRIPTOR, REPORT_DESCRIPTOR, CONSUMER, _) => {
+                self.read_descriptor(&hid::CONSUMER, length)
+            }
             (STANDARD_DEVICE_OUT, SET_ADDRESS, address @ 0..=127, 0, 0) if !self.configured => {
                 self.status(Commit::Address(address as u8))
             }
@@ -297,7 +394,7 @@ impl Device {
                 self.read(&[u8::from(self.configured)], 1)
             }
             (STANDARD_DEVICE_IN, GET_STATUS, 0, 0, 2) => self.read(&[0, 0], 2),
-            (STANDARD_INTERFACE_IN, GET_STATUS, 0, KEYBOARD, 2) if self.configured => {
+            (STANDARD_INTERFACE_IN, GET_STATUS, 0, KEYBOARD | CONSUMER, 2) if self.configured => {
                 self.read(&[0, 0], 2)
             }
             (STANDARD_ENDPOINT_IN, GET_STATUS, 0, CONTROL_OUT | CONTROL_IN, 2) => {
@@ -306,19 +403,38 @@ impl Device {
             (STANDARD_ENDPOINT_IN, GET_STATUS, 0, KEYBOARD_IN, 2) if self.configured => {
                 self.read(&[u8::from(self.halted), 0], 2)
             }
+            (STANDARD_ENDPOINT_IN, GET_STATUS, 0, CONSUMER_IN, 2) if self.configured => {
+                self.read(&[u8::from(self.ep2_halted), 0], 2)
+            }
             (
                 STANDARD_ENDPOINT_OUT,
                 request @ (CLEAR_FEATURE | SET_FEATURE),
                 ENDPOINT_HALT,
                 KEYBOARD_IN,
                 0,
-            ) if self.configured => self.status(Commit::Halt(request == SET_FEATURE)),
-            (STANDARD_INTERFACE_IN, GET_INTERFACE, 0, KEYBOARD, 1) if self.configured => {
+            ) if self.configured => {
+                self.status(Commit::Halt(Interface::Keyboard, request == SET_FEATURE))
+            }
+            (
+                STANDARD_ENDPOINT_OUT,
+                request @ (CLEAR_FEATURE | SET_FEATURE),
+                ENDPOINT_HALT,
+                CONSUMER_IN,
+                0,
+            ) if self.configured => {
+                self.status(Commit::Halt(Interface::Consumer, request == SET_FEATURE))
+            }
+            (STANDARD_INTERFACE_IN, GET_INTERFACE, 0, KEYBOARD | CONSUMER, 1)
+                if self.configured =>
+            {
                 self.read(&[0], 1)
             }
             // Re-selecting the only alternate setting resets the endpoint, as on a halt clear.
             (STANDARD_INTERFACE_OUT, SET_INTERFACE, 0, KEYBOARD, 0) if self.configured => {
-                self.status(Commit::Halt(false))
+                self.status(Commit::Halt(Interface::Keyboard, false))
+            }
+            (STANDARD_INTERFACE_OUT, SET_INTERFACE, 0, CONSUMER, 0) if self.configured => {
+                self.status(Commit::Halt(Interface::Consumer, false))
             }
             (CLASS_INTERFACE_IN, GET_REPORT, INPUT_REPORT, KEYBOARD, _) if self.configured => {
                 let report = self.report;
@@ -331,11 +447,23 @@ impl Device {
             (CLASS_INTERFACE_IN, GET_REPORT, OUTPUT_REPORT, KEYBOARD, _) if self.configured => {
                 self.read(&[self.leds], length)
             }
+            (CLASS_INTERFACE_IN, GET_REPORT, INPUT_REPORT, CONSUMER, _) if self.configured => {
+                let consumer = self.consumer.to_le_bytes();
+                self.read(&consumer, length)
+            }
             (CLASS_INTERFACE_IN, GET_IDLE, 0, KEYBOARD, 1) if self.configured => {
                 self.read(&[self.idle], 1)
             }
+            (CLASS_INTERFACE_IN, GET_IDLE, 0, CONSUMER, 1) if self.configured => {
+                self.read(&[self.consumer_idle], 1)
+            }
             (CLASS_INTERFACE_IN, GET_PROTOCOL, 0, KEYBOARD, 1) if self.configured => {
                 self.read(&[self.protocol as u8], 1)
+            }
+            (CLASS_INTERFACE_OUT, SET_IDLE, _, CONSUMER, 0)
+                if self.configured && idle_report == 0 =>
+            {
+                self.status(Commit::ConsumerIdle(idle))
             }
             (CLASS_INTERFACE_OUT, SET_REPORT, OUTPUT_REPORT, KEYBOARD, 1) if self.configured => {
                 self.control = Control::LedsOut;
@@ -377,6 +505,13 @@ impl Device {
             }
             return Action::None;
         }
+        if endpoint == Interface::Consumer.endpoint() {
+            if let Some(usage) = self.consumer_in_flight.take() {
+                self.consumer_acknowledged = Some(usage);
+                self.consumer_last_report_at = now;
+            }
+            return Action::None;
+        }
         if endpoint != 0 {
             return Action::None;
         }
@@ -410,19 +545,40 @@ impl Device {
                 Commit::Configuration(configured) => {
                     self.configured = configured;
                     self.halted = false;
+                    self.ep2_halted = false;
                     self.in_flight = None;
                     self.acknowledged = None;
+                    self.pending.clear();
+                    self.consumer_in_flight = None;
+                    self.consumer_acknowledged = None;
+                    self.cancel_consumer();
                     Action::Configure(configured)
                 }
-                Commit::Halt(halted) => {
-                    self.halted = halted;
-                    self.in_flight = None;
-                    self.acknowledged = None;
-                    Action::Halt(halted)
+                Commit::Halt(interface, halted) => {
+                    match interface {
+                        Interface::Keyboard => {
+                            self.halted = halted;
+                            self.in_flight = None;
+                            self.acknowledged = None;
+                            self.pending.clear();
+                        }
+                        Interface::Consumer => {
+                            self.ep2_halted = halted;
+                            self.consumer_in_flight = None;
+                            self.consumer_acknowledged = None;
+                            self.cancel_consumer();
+                        }
+                    }
+                    Action::Halt(interface.endpoint_address(), halted)
                 }
                 Commit::Protocol(protocol) => {
                     self.protocol = protocol;
                     self.acknowledged = None;
+                    Action::None
+                }
+                Commit::ConsumerIdle(idle) => {
+                    self.consumer_idle = idle;
+                    self.consumer_last_report_at = now;
                     Action::None
                 }
                 Commit::Idle(idle) => {
@@ -494,21 +650,21 @@ mod tests {
         );
         let mut rest = config.as_slice();
         let mut types = Vec::new();
+        let mut interfaces = Vec::new();
+        let mut endpoints = Vec::new();
         while !rest.is_empty() {
             let (descriptor, tail) = rest.split_at(rest[0] as usize);
             types.push(descriptor[1]);
             match descriptor[1] {
-                4 => assert_eq!(&descriptor[5..8], &[3, 1, 1]),
-                0x21 => assert_eq!(
-                    u16::from_le_bytes([descriptor[7], descriptor[8]]) as usize,
-                    hid::KEYBOARD.len()
-                ),
-                5 => assert_eq!(&descriptor[2..], &[0x81, 3, 8, 0, 1]),
+                4 => interfaces.push(descriptor[2]),
+                5 => endpoints.push(descriptor[2]),
                 _ => {}
             }
             rest = tail;
         }
-        assert_eq!(types, [2, 4, 0x21, 5]);
+        assert_eq!(types, [2, 4, 0x21, 5, 4, 0x21, 5]);
+        assert_eq!(interfaces, [0, 1]);
+        assert_eq!(endpoints, [0x81, 0x82]);
         assert_eq!(
             read_all(&mut device, setup(0x81, 6, 0x2200, 0, 255)),
             hid::KEYBOARD
@@ -516,6 +672,14 @@ mod tests {
         assert_eq!(
             data(device.setup(setup(0x81, 6, 0x2100, 0, 255))),
             KEYBOARD_HID
+        );
+        assert_eq!(
+            read_all(&mut device, setup(0x81, 6, 0x2200, 1, 255)),
+            hid::CONSUMER
+        );
+        assert_eq!(
+            data(device.setup(setup(0x81, 6, 0x2100, 1, 255))),
+            CONSUMER_HID
         );
         let string = data(device.setup(setup(0x80, 6, 0x0301, 0x0409, 255)));
         let utf16: Vec<u16> = string[2..]
@@ -649,7 +813,7 @@ mod tests {
             setup(0xa1, 1, 0x0300, 0, 0),
             setup(0x40, 6, 0x0100, 0, 18),
             setup(0, 6, 0x0100, 0, 18),
-            setup(0x81, 6, 0x2200, 1, 63),
+            setup(0x81, 6, 0x2200, 2, 63),
             setup(0x80, 6, 0x0600, 0, 10),
             setup(0, 5, 128, 0, 0),
             setup(0, 9, 2, 0, 0),
@@ -719,6 +883,66 @@ mod tests {
     }
 
     #[test]
+    fn complete_key_taps_survive_a_busy_endpoint() {
+        let mut device = configured();
+        device.report_queued([0; 8]);
+        let caps = [0, 0, 0x39, 0, 0, 0, 0, 0];
+        let a = [0, 0, 4, 0, 0, 0, 0, 0];
+        for report in [caps, [0; 8], a, [0; 8]] {
+            device.set_report(report);
+        }
+        assert_eq!(device.report_due(0), None);
+        device.in_complete(1, 1);
+        for report in [caps, [0; 8], a, [0; 8]] {
+            assert_eq!(device.report_due(1), Some(report));
+            device.report_queued(report);
+            assert_eq!(device.report_due(1), None);
+            device.in_complete(1, 2);
+        }
+        assert_eq!(device.report_due(2), None);
+    }
+
+    #[test]
+    fn keyboard_overflow_eventually_delivers_the_current_physical_state() {
+        let mut device = configured();
+        let held = [2, 0, 4, 0, 0, 0, 0, 0];
+        device.set_report(held);
+        device.report_queued(held);
+        for usage in (4..30).cycle().take(200) {
+            device.set_report([0, 0, usage, 0, 0, 0, 0, 0]);
+        }
+        device.set_report([0; 8]);
+        device.in_complete(1, 0);
+        let mut last = held;
+        let mut sent = 0;
+        while let Some(report) = device.report_due(0) {
+            assert!(sent < 200, "queue did not drain");
+            device.report_queued(report);
+            device.in_complete(1, 0);
+            last = report;
+            sent += 1;
+        }
+        assert_eq!(last, [0; 8]);
+    }
+
+    #[test]
+    fn suspended_keyboard_discards_taps_but_keeps_physically_held_keys() {
+        let mut device = configured();
+        let a = [0, 0, 4, 0, 0, 0, 0, 0];
+        let shift = [2, 0, 0, 0, 0, 0, 0, 0];
+        device.set_report(a);
+        device.report_queued(a);
+        device.set_report([0; 8]);
+        device.set_suspended(true);
+        device.set_report(shift);
+        device.set_suspended(false);
+        assert_eq!(device.report_due(0), Some(shift));
+        device.report_queued(shift);
+        device.in_complete(1, 0);
+        assert_eq!(device.report_due(0), None);
+    }
+
+    #[test]
     fn idle_uses_four_ms_units_and_wraps() {
         let mut device = configured();
         device.report_queued([0; 8]);
@@ -738,11 +962,11 @@ mod tests {
         let mut device = configured();
         device.report_queued([0; 8]);
         device.setup(setup(2, 3, 0, 0x81, 0));
-        assert_eq!(device.in_complete(0, 0), Action::Halt(true));
+        assert_eq!(device.in_complete(0, 0), Action::Halt(0x81, true));
         assert_eq!(device.report_due(0), None);
         assert_eq!(data(device.setup(setup(0x82, 0, 0, 0x81, 2))), [1, 0]);
         device.setup(setup(2, 1, 0, 0x81, 0));
-        assert_eq!(device.in_complete(0, 0), Action::Halt(false));
+        assert_eq!(device.in_complete(0, 0), Action::Halt(0x81, false));
         assert_eq!(device.report_due(0), Some([0; 8]));
         device.set_suspended(true);
         assert_eq!(device.report_due(0), None);
@@ -754,5 +978,132 @@ mod tests {
         device.reset();
         assert_eq!(device.setup(setup(0xa1, 3, 0, 0, 1)), Action::Stall);
         assert_eq!(device.report_due(0), None);
+    }
+
+    #[test]
+    fn consumer_reports_flow_independently_of_the_keyboard() {
+        let mut device = configured();
+        assert_eq!(device.consumer_due(0), Some([0, 0]));
+        device.consumer_queued(0);
+        device.in_complete(2, 0);
+        assert_eq!(device.consumer_due(0), None);
+        assert!(device.enqueue_consumer(0x00e9)); // volume up
+        assert_eq!(device.consumer_due(0), Some([0xe9, 0]));
+        device.consumer_queued(0x00e9);
+        // Release while the press is still in flight: it must wait its turn.
+        assert!(device.enqueue_consumer(0));
+        assert_eq!(device.consumer_due(0), None);
+        device.in_complete(2, 10);
+        assert_eq!(device.consumer_due(0), Some([0, 0]));
+        device.consumer_queued(0);
+        device.in_complete(2, 20);
+        assert_eq!(device.consumer_due(0), None);
+        assert_eq!(data(device.setup(setup(0xa1, 1, 0x0100, 1, 2))), [0, 0]);
+    }
+
+    #[test]
+    fn consumer_endpoint_halts_independently() {
+        let mut device = configured();
+        assert!(device.enqueue_consumer(0x00cd));
+        device.setup(setup(2, 3, 0, 0x82, 0));
+        assert_eq!(device.in_complete(0, 0), Action::Halt(0x82, true));
+        assert_eq!(device.consumer_due(0), None);
+        assert_eq!(device.report_due(0), Some([0; 8]));
+        assert_eq!(data(device.setup(setup(0x82, 0, 0, 0x82, 2))), [1, 0]);
+        device.setup(setup(2, 1, 0, 0x82, 0));
+        assert_eq!(device.in_complete(0, 0), Action::Halt(0x82, false));
+        assert_eq!(device.consumer_due(0), Some([0, 0]));
+    }
+
+    #[test]
+    fn consumer_idle_is_independent_and_requires_report_zero() {
+        let mut device = configured();
+        device.consumer_queued(0);
+        device.in_complete(2, 10);
+        device.setup(setup(0x21, 10, 0x0200, 1, 0));
+        device.in_complete(0, 10);
+        assert_eq!(data(device.setup(setup(0xa1, 2, 0, 1, 1))), [2]);
+        assert_eq!(data(device.setup(setup(0xa1, 2, 0, 0, 1))), [0]);
+        assert_eq!(device.consumer_due(17), None);
+        assert_eq!(device.consumer_due(18), Some([0, 0]));
+        assert_eq!(device.setup(setup(0x21, 10, 0x0201, 1, 0)), Action::Stall);
+        assert_eq!(device.setup(setup(0xa1, 3, 0, 1, 1)), Action::Stall);
+    }
+
+    #[test]
+    fn canceled_volume_is_released_even_with_an_in_flight_press() {
+        let mut device = configured();
+        assert!(device.enqueue_consumer(0xe9));
+        device.consumer_queued(0xe9);
+        assert!(device.enqueue_consumer(0));
+        assert!(device.enqueue_consumer(0xcd));
+        device.cancel_consumer();
+        device.in_complete(2, 1);
+        assert_eq!(device.consumer_due(1), Some([0, 0]));
+        device.consumer_queued(0);
+        device.in_complete(2, 2);
+        assert_eq!(device.consumer_due(2), None);
+    }
+
+    #[test]
+    fn media_taps_survive_a_busy_endpoint() {
+        let mut device = configured();
+        device.consumer_queued(0);
+        for usage in [0xb5, 0, 0xcd, 0, 0xea, 0] {
+            assert!(device.enqueue_consumer(usage));
+        }
+        assert_eq!(device.consumer_due(0), None);
+        device.in_complete(2, 1);
+        for usage in [0xb5u16, 0, 0xcd, 0, 0xea, 0] {
+            assert_eq!(device.consumer_due(0), Some(usage.to_le_bytes()));
+            device.consumer_queued(usage);
+            assert_eq!(device.consumer_due(0), None);
+            device.in_complete(2, 2);
+        }
+        assert_eq!(device.consumer_due(0), None);
+    }
+
+    #[test]
+    fn media_overflow_releases_the_in_flight_key() {
+        let mut device = configured();
+        assert!(device.enqueue_consumer(0xe9));
+        device.consumer_queued(0xe9);
+        let mut accepted = 0;
+        for usage in [0, 0xcd].into_iter().cycle().take(100) {
+            if !device.enqueue_consumer(usage) {
+                break;
+            }
+            accepted += 1;
+        }
+        assert!((1..100).contains(&accepted));
+        device.in_complete(2, 1);
+        assert_eq!(device.consumer_due(0), Some([0, 0]));
+        device.consumer_queued(0);
+        device.in_complete(2, 2);
+        assert_eq!(device.consumer_due(0), None);
+    }
+
+    #[test]
+    fn suspend_and_reset_discard_stale_media_gestures() {
+        let mut device = configured();
+        assert!(device.enqueue_consumer(0xe9));
+        device.consumer_queued(0xe9);
+        assert!(device.enqueue_consumer(0));
+        assert!(device.enqueue_consumer(0xcd));
+        device.set_suspended(true);
+        assert!(!device.enqueue_consumer(0xb5));
+        device.set_suspended(false);
+        // Resume must not wait for (or transmit) the canceled DMA press.
+        assert_eq!(device.consumer_due(0), Some([0, 0]));
+        device.in_complete(2, 1);
+        assert_eq!(device.consumer_due(0), Some([0, 0]));
+        assert!(device.enqueue_consumer(0xea));
+        device.reset();
+        assert!(!device.enqueue_consumer(0xcd));
+        device.setup(setup(0, 5, 1, 0, 0));
+        device.in_complete(0, 0);
+        device.setup(setup(0, 9, 1, 0, 0));
+        device.in_complete(0, 0);
+        assert_eq!(device.consumer_due(0), Some([0, 0]));
     }
 }
