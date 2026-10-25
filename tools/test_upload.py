@@ -6,6 +6,7 @@ The synthetic peer is not an implementation of the missing vendor loader.
 import contextlib
 import hashlib
 import io
+import itertools
 import struct
 import tempfile
 import unittest
@@ -18,9 +19,11 @@ from upload import (
     HidTransport,
     UploadError,
     data_reports,
+    find_loader,
     main,
     select_device,
     upload,
+    wait_for_loader,
 )
 
 
@@ -242,6 +245,77 @@ class UploaderTests(unittest.TestCase):
         ]:
             with self.subTest(devices=devices), self.assertRaises(ValueError):
                 select_device(devices, path, application=application)
+
+    def test_loader_lookup_matches_serial_and_rejects_ambiguity(self):
+        loader = {
+            "path": b"loader",
+            "vendor_id": 0x19F5,
+            "product_id": 0x0730,
+            "serial_number": "NuPhy Kick75",
+        }
+        app = {
+            "path": b"app",
+            "vendor_id": 0x19F5,
+            "product_id": 0x1030,
+            "serial_number": "NuPhy Keybord 0720",
+        }
+        self.assertIsNone(find_loader([app], "kick75"))
+        self.assertIsNone(find_loader([app, loader], "keybord"))
+        self.assertEqual(find_loader([app, loader], "kick75"), loader)
+        self.assertEqual(find_loader([app, loader], None), loader)
+        with self.assertRaises(ValueError):
+            find_loader([loader, loader | {"path": b"other"}], "kick75")
+
+    def test_wait_for_loader_polls_until_one_appears(self):
+        loader = {
+            "path": b"loader",
+            "vendor_id": 0x19F5,
+            "product_id": 0x0730,
+            "serial_number": "NuPhy Kick75",
+        }
+        seen = [[], [], [loader]]
+        with (
+            patch("upload.matching_devices", side_effect=lambda: seen.pop(0)),
+            patch("upload.time.sleep") as sleep,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(wait_for_loader("kick75"), loader)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_wait_for_loader_gives_up_at_the_timeout(self):
+        ticks = itertools.count(0, 0.5)
+        with (
+            patch("upload.matching_devices", return_value=[]),
+            patch("upload.time.sleep"),
+            patch("upload.time.monotonic", side_effect=lambda: next(ticks)),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(UploadError),
+        ):
+            wait_for_loader("kick75", timeout=2.0)
+
+    def test_cli_flash_can_wait_for_the_loader(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "test.bin"
+            image.write_bytes(self.raw)
+            device = FakeHid()
+            hid = Mock()
+            hid.enumerate.return_value = []
+            hid.device.return_value = device
+            with (
+                patch.dict("sys.modules", {"hid": hid}),
+                patch(
+                    "upload.wait_for_loader",
+                    return_value={
+                        "path": b"loader",
+                        "vendor_id": 0x19F5,
+                        "product_id": 0x0730,
+                    },
+                ) as waited,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(main(["flash", str(image), "--serial", "kick75"]), 1)
+            waited.assert_called_once_with("kick75", None)
+            device.open_path.assert_called_once_with(b"loader")
 
     def test_cli_invalid_image_does_not_access_hid(self):
         with tempfile.TemporaryDirectory() as directory:

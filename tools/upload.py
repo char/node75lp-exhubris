@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,6 +61,76 @@ def data_reports(command, data):
 
 class UploadError(RuntimeError):
     pass
+
+
+def matching_devices():
+    """Every Node75 application or loader HID interface currently enumerated."""
+    import hid
+
+    return [
+        device
+        for device in hid.enumerate(VID, 0)
+        if device.get("vendor_id") == VID
+        and device.get("product_id") in (APP_PID, LOADER_PID)
+        and isinstance(device.get("path"), (bytes, str))
+    ]
+
+
+def find_loader(devices, serial):
+    """The single loader whose serial contains `serial`, ignoring case."""
+    loaders = [d for d in devices if d.get("product_id") == LOADER_PID]
+    if serial is None:
+        candidates = loaders
+    else:
+        candidates = [
+            device
+            for device in loaders
+            if serial.casefold() in str(device.get("serial_number") or "").casefold()
+        ]
+    if len(candidates) > 1:
+        listed = ", ".join(
+            f"{os.fsdecode(device['path'])} ({device.get('serial_number')})"
+            for device in candidates
+        )
+        raise ValueError(f"serial matches {len(candidates)} loaders: {listed}")
+    return candidates[0] if candidates else None
+
+
+def wait_for_loader(serial=None, timeout=None, poll=0.5, report=2.0):
+    """Blocks until exactly one matching loader is enumerated.
+
+    The keyboard is the only input device here, so the command has to be running
+    before the keyboard can be put into loader mode - hence waiting rather than
+    requiring a path up front.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    last_report = 0.0
+    while True:
+        devices = matching_devices()
+        loader = find_loader(devices, serial)
+        if loader is not None:
+            return loader
+        now = time.monotonic()
+        if now - last_report >= report:
+            last_report = now
+            seen = ", ".join(
+                f"{device.get('serial_number') or '?'} "
+                f"({'loader' if device.get('product_id') == LOADER_PID else 'application'})"
+                for device in devices
+            )
+            wanted = f"matching {serial!r}" if serial else "any serial"
+            print(
+                f"waiting for a loader ({wanted}); currently seen: {seen or 'nothing'}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if deadline is not None and now >= deadline:
+            raise UploadError(
+                f"no matching loader appeared within {timeout:.0f} s"
+                if serial is None
+                else f"no loader matching {serial!r} appeared within {timeout:.0f} s"
+            )
+        time.sleep(poll)
 
 
 def upload(transport, firmware, progress=None):
@@ -176,10 +247,20 @@ def main(argv=None):
         "--path", required=True, help="application interface path from list"
     )
     flash = commands.add_parser(
-        "flash", help="erase/program/verify an already-connected loader"
+        "flash", help="erase/program/verify a connected loader, or wait for one"
     )
     flash.add_argument("image", type=Path)
-    flash.add_argument("--path", required=True, help="exact loader path from list")
+    target = flash.add_mutually_exclusive_group(required=True)
+    target.add_argument("--path", help="exact loader path from list")
+    target.add_argument(
+        "--serial",
+        nargs="?",
+        const="",
+        help="wait for a loader whose serial contains this text (any loader if omitted)",
+    )
+    flash.add_argument(
+        "--timeout", type=float, help="give up waiting for a loader after this many seconds"
+    )
     args = parser.parse_args(argv)
     transport = None
 
@@ -196,13 +277,7 @@ def main(argv=None):
             raise UploadError(
                 "hidapi is required for device access; use uv run tools/upload.py"
             ) from error
-        devices = [
-            device
-            for device in hid.enumerate(VID, 0)
-            if device.get("vendor_id") == VID
-            and device.get("product_id") in (APP_PID, LOADER_PID)
-            and isinstance(device.get("path"), (bytes, str))
-        ]
+        devices = matching_devices()
         if args.command == "list":
             if not devices:
                 print(
@@ -229,9 +304,19 @@ def main(argv=None):
             )
             return 0
 
-        info = select_device(
-            devices, args.path, application=args.command == "enter-loader"
-        )
+        if args.command == "flash" and args.path is None:
+            # Flash after the loader appears, not before: with one keyboard there
+            # is nothing left to type with once it is in loader mode.
+            print(
+                "Prepared. Put the keyboard into loader mode now; Ctrl-C aborts.",
+                file=sys.stderr,
+                flush=True,
+            )
+            info = wait_for_loader(args.serial or None, args.timeout)
+        else:
+            info = select_device(
+                devices, args.path, application=args.command == "enter-loader"
+            )
         device = hid.device()
         try:
             device.open_path(os.fsencode(info["path"]))
