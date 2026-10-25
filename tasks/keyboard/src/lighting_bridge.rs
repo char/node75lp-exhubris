@@ -11,8 +11,8 @@ pub fn observer() -> impl FnMut([u16; 6], u32, bool, u8) {
             return;
         }
         last_update = Some((now, active, leds));
-        // A blocked sender cannot change state before Recv in this cooperative,
-        // two-task app. Never make USB wait for a faulted or unresponsive renderer.
+        // Only this receiver can unblock the sender. Never make USB wait
+        // for a faulted or unresponsive renderer.
         let status = kipc::read_task_status(usize::from(SLOTS.lighting.task_index()));
         if !replies::is_sending_to_us(status) {
             return;

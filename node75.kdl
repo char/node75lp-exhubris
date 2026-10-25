@@ -10,15 +10,24 @@ task keyboard {
     workspace-crate node75-keyboard
     // Stateful keymap and nested USB calls exceed 2 KiB.
     stack-size 4096
-    priority 1
+    priority 2
     uses-peripheral trusted-board-io
     // The slot table includes this task, so the code can name its own id.
     uses-task keyboard
     uses-task lighting
+    uses-task touch
 }
 
 task lighting {
     workspace-crate node75-lighting
+    stack-size 2048
+    priority 1
+    uses-peripheral trusted-board-io
+    uses-task keyboard
+}
+
+task touch {
+    workspace-crate node75-touch
     stack-size 2048
     priority 0
     uses-peripheral trusted-board-io

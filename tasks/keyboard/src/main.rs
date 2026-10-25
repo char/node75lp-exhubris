@@ -10,6 +10,8 @@ mod usb_hw;
 
 mod lighting_bridge;
 
+mod media_bridge;
+
 mod replies;
 
 mod board {
@@ -99,6 +101,7 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
                 ));
             });
             last_scan = now;
+            media_bridge::receive(&mut device);
         }
         if let Some(report) = device.report_due(now)
             && hardware.transmit(1, &report)

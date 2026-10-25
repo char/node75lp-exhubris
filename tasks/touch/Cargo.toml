@@ -1,0 +1,14 @@
+[package]
+name = "node75-touch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = { version = "2", default-features = false }
+node75-touch-api = { path = "../../lib/touch-api" }
+userlib = { path = "../../vendor/exhubris/sys/userlib", features = ["no-panic-messages"] }
+hubris-task-slots = { path = "../../vendor/exhubris/sys/task-slots" }
+
+[[bin]]
+name = "node75-touch"
+path = "src/main.rs"

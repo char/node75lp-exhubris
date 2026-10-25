@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+node75-touch-api = { path = "../../lib/touch-api" }
 node75-lighting-api = { path = "../../lib/lighting-api" }
 kipc = { path = "../../vendor/exhubris/sys/kipc" }
 hubris-abi = { package = "abi", path = "../../vendor/hubris/sys/abi" }
