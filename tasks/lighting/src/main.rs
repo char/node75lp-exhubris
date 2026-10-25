@@ -46,7 +46,7 @@ fn main() -> ! {
             lighting.clear(state.keys);
         }
         lights.poll(state.active, state.now, || {
-            lighting.frame(state.now, state.leds & 2 != 0)
+            lighting.frame(state.now, state.leds & 2 != 0, state.touching)
         });
     }
 }

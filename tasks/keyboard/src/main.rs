@@ -54,6 +54,7 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
     let mut last_scan = clock.millis();
     let mut keys = [0; 6];
     let mut observe = lighting_bridge::observer();
+    let mut touching = false;
     loop {
         let mut now = clock.millis();
         if let Some(event) = hardware.poll() {
@@ -101,7 +102,7 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
                 ));
             });
             last_scan = now;
-            media_bridge::receive(&mut device);
+            media_bridge::receive(&mut device, &mut touching);
         }
         if let Some(report) = device.report_due(now)
             && hardware.transmit(1, &report)
@@ -114,6 +115,12 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
             device.consumer_queued(u16::from_le_bytes(report));
         }
         // GPIO and USB register transactions are complete before IPC can yield.
-        observe(keys, now, device.active(), device.leds());
+        observe(node75_lighting_api::State {
+            keys,
+            now,
+            active: device.active(),
+            leds: device.leds(),
+            touching,
+        });
     }
 }

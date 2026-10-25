@@ -8,6 +8,22 @@ extern crate std;
 /// IPC operation: touch task → keyboard task, payload [`MediaEvent`].
 pub const MEDIA_KEY: u16 = 1;
 
+/// IPC operation: touch task → keyboard task, sent whenever a finger lands on
+/// or leaves the bar. Payload [`encode_contact`].
+pub const CONTACT: u16 = 2;
+
+pub fn encode_contact(touching: bool) -> [u8; 1] {
+    [u8::from(touching)]
+}
+
+pub fn decode_contact(bytes: &[u8]) -> Option<bool> {
+    match bytes {
+        [0] => Some(false),
+        [1] => Some(true),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Media {
     NextTrack,
@@ -367,5 +383,15 @@ mod tests {
         assert_eq!(MediaEvent::decode(&[9, 1]), None);
         assert_eq!(MediaEvent::decode(&[0, 2]), None);
         assert_eq!(MediaEvent::decode(&[]), None);
+    }
+
+    #[test]
+    fn contact_codec_roundtrips_and_rejects_garbage() {
+        for touching in [false, true] {
+            assert_eq!(decode_contact(&encode_contact(touching)), Some(touching));
+        }
+        assert_eq!(decode_contact(&[2]), None);
+        assert_eq!(decode_contact(&[]), None);
+        assert_eq!(decode_contact(&[1, 0]), None);
     }
 }

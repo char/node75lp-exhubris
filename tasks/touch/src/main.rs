@@ -2,7 +2,7 @@
 #![no_main]
 
 use hubris_task_slots::SLOTS;
-use node75_touch_api::{Gestures, MEDIA_KEY, MediaEvent};
+use node75_touch_api::{CONTACT, Gestures, MEDIA_KEY, MediaEvent, encode_contact};
 
 mod i2c;
 mod sensor;
@@ -20,6 +20,7 @@ fn main() -> ! {
     let mut last_sample = None;
     let mut last_probe = 0u32;
     let mut inhibited = true;
+    let mut touching = false;
     loop {
         let now = userlib::sys_get_timer().now;
         userlib::sys_set_timer(Some(now + sensor.poll_delay()), TICK);
@@ -28,6 +29,7 @@ fn main() -> ! {
         let now = userlib::sys_get_timer().now as u32;
         match sample {
             Service::Position(position) => {
+                report_contact(&mut touching, position.is_some());
                 last_sample = position.map(|_| now);
                 if position.is_none() {
                     inhibited = false;
@@ -44,6 +46,7 @@ fn main() -> ! {
                 }
             }
             Service::Invalid => {
+                report_contact(&mut touching, false);
                 gestures.cancel(|event| {
                     send(event);
                 });
@@ -52,6 +55,7 @@ fn main() -> ! {
             }
             Service::Idle => {
                 if last_sample.is_some_and(|at| now.wrapping_sub(at) >= STALE_MS) {
+                    report_contact(&mut touching, false);
                     gestures.cancel(|event| {
                         send(event);
                     });
@@ -65,6 +69,22 @@ fn main() -> ! {
             }
         }
     }
+}
+
+/// Tell the keyboard when a finger lands on or leaves the bar, for lighting.
+fn report_contact(touching: &mut bool, contact: bool) {
+    if *touching == contact {
+        return;
+    }
+    *touching = contact;
+    // Cosmetic only: a keyboard that cannot take the update loses nothing.
+    let _ = userlib::sys_send(
+        SLOTS.keyboard,
+        CONTACT,
+        &encode_contact(contact),
+        &mut [],
+        &mut [],
+    );
 }
 
 fn send(event: MediaEvent) -> bool {

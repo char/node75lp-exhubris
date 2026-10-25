@@ -3,14 +3,15 @@ use hubris_task_slots::SLOTS;
 use node75_lighting_api::{GET_STATE, STATE_BYTES, State};
 use userlib::{ReplyFaultReason, ResponseCode};
 
-pub fn observer() -> impl FnMut([u16; 6], u32, bool, u8) {
+pub fn observer() -> impl FnMut(State) {
     let mut last_update = None;
-    move |keys, now, active, leds| {
-        // At most one roundtrip per millisecond unless USB state changes.
-        if last_update == Some((now, active, leds)) {
+    move |state: State| {
+        // At most one roundtrip per millisecond unless USB or touch state changes.
+        let update = (state.now, state.active, state.leds, state.touching);
+        if last_update == Some(update) {
             return;
         }
-        last_update = Some((now, active, leds));
+        last_update = Some(update);
         // Only this receiver can unblock the sender. Never make USB wait
         // for a faulted or unresponsive renderer.
         let status = kipc::read_task_status(usize::from(SLOTS.lighting.task_index()));
@@ -35,16 +36,6 @@ pub fn observer() -> impl FnMut([u16; 6], u32, bool, u8) {
             userlib::sys_reply_fault(message.sender, fault);
             return;
         }
-        userlib::sys_reply(
-            message.sender,
-            ResponseCode::SUCCESS,
-            &State {
-                keys,
-                now,
-                active,
-                leds,
-            }
-            .encode(),
-        );
+        userlib::sys_reply(message.sender, ResponseCode::SUCCESS, &state.encode());
     }
 }

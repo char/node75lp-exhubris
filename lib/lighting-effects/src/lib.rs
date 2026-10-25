@@ -1,6 +1,6 @@
-//! Lighting effects: reactive magenta fade on keypress, magenta corner
-//! bar, host Caps Lock indication. Pure logic; the SPI/DMA driver is in
-//! the lighting task.
+//! Lighting effects: reactive magenta fade on keypress, a corner bar that
+//! turns from magenta to cyan while the touch bar is touched, host Caps
+//! Lock indication. Pure logic; the SPI/DMA driver is in the lighting task.
 
 #![no_std]
 
@@ -64,6 +64,14 @@ const fn magenta(value: u8) -> Rgb {
     }
 }
 
+const fn cyan(value: u8) -> Rgb {
+    Rgb {
+        red: 0,
+        green: value,
+        blue: value,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Hit {
     led: u8,
@@ -102,9 +110,9 @@ impl Lighting {
         self.previous = keys;
     }
 
-    pub fn frame(&self, now: u32, caps_lock: bool) -> [Rgb; LEDS] {
+    pub fn frame(&self, now: u32, caps_lock: bool, touching: bool) -> [Rgb; LEDS] {
         let mut colors = [Rgb::default(); LEDS];
-        colors[..BAR_LEDS].fill(magenta(4));
+        colors[..BAR_LEDS].fill(if touching { cyan(4) } else { magenta(4) });
         for hit in self.hits.iter().flatten() {
             let faded = (now.wrapping_sub(hit.at) / 2).min(255) as usize;
             colors[BAR_LEDS + usize::from(hit.led)] = magenta(FADE[255 - faded]);
@@ -155,35 +163,49 @@ mod tests {
         let mut lighting = Lighting::default();
         let a = [0, 0, 0, 2, 0, 0];
         lighting.update(a, 1000);
-        let fresh = lighting.frame(1000, false);
+        let fresh = lighting.frame(1000, false, false);
         assert_eq!(lit_keys(&fresh), [63]);
         assert!(fresh[63].red > 0);
         assert_eq!(fresh[63].red, fresh[63].blue);
         assert_eq!(fresh[63].green, 0);
         lighting.update(a, 1300);
-        let dim = lighting.frame(1300, false)[63];
+        let dim = lighting.frame(1300, false, false)[63];
         assert!(dim.red > 0 && dim.red < fresh[63].red);
         lighting.update(a, 1510);
-        assert!(lit_keys(&lighting.frame(1510, false)).is_empty());
+        assert!(lit_keys(&lighting.frame(1510, false, false)).is_empty());
         lighting.update([0; 6], 1520);
         lighting.update(a, 1530);
-        assert_eq!(lighting.frame(1530, false)[63], fresh[63]);
+        assert_eq!(lighting.frame(1530, false, false)[63], fresh[63]);
     }
 
     #[test]
-    fn caps_follows_host_state_only_and_corners_stay_magenta() {
+    fn caps_follows_host_state_only() {
         let mut lighting = Lighting::default();
         lighting.update([0, 0, 0, 1, 0, 0], 0);
-        assert!(lit_keys(&lighting.frame(0, false)).is_empty());
-        let enabled = lighting.frame(0, true);
+        assert!(lit_keys(&lighting.frame(0, false, false)).is_empty());
+        let enabled = lighting.frame(0, true, false);
         assert_eq!(lit_keys(&enabled), [64]);
-        assert_eq!(lighting.frame(10000, true), enabled);
-        assert!(lit_keys(&lighting.frame(10001, false)).is_empty());
+        assert_eq!(lighting.frame(10000, true, false), enabled);
+        assert!(lit_keys(&lighting.frame(10001, false, false)).is_empty());
+    }
+
+    #[test]
+    fn corners_are_magenta_and_turn_cyan_while_the_bar_is_touched() {
+        let mut lighting = Lighting::default();
+        lighting.update([0, 0, 0, 2, 0, 0], 0);
+        let idle = lighting.frame(0, true, false);
+        let touched = lighting.frame(0, true, true);
         assert!(
-            enabled[..BAR_LEDS]
+            idle[..BAR_LEDS]
                 .iter()
                 .all(|color| color.red > 0 && color.red == color.blue && color.green == 0)
         );
+        assert!(
+            touched[..BAR_LEDS]
+                .iter()
+                .all(|color| color.green > 0 && color.green == color.blue && color.red == 0)
+        );
+        assert_eq!(idle[BAR_LEDS..], touched[BAR_LEDS..]);
     }
 
     #[test]
@@ -191,22 +213,22 @@ mod tests {
         let mut lighting = Lighting::default();
         let start = u32::MAX - 100;
         lighting.update([1, 0, 0, 0, 0, 0], start);
-        let fresh = lighting.frame(start, false)[5];
-        let dim = lighting.frame(start.wrapping_add(300), false)[5];
+        let fresh = lighting.frame(start, false, false)[5];
+        let dim = lighting.frame(start.wrapping_add(300), false, false)[5];
         assert!(dim.red > 0 && dim.red < fresh.red);
         lighting.update([0; 6], start.wrapping_add(510));
-        assert!(lit_keys(&lighting.frame(start, false)).is_empty());
+        assert!(lit_keys(&lighting.frame(start, false, false)).is_empty());
     }
 
     #[test]
     fn holes_are_ignored_but_fn_is_reactive_and_sleep_forgets_presses() {
         let mut lighting = Lighting::default();
         lighting.update([0, 1 << 14, 0, 0, 0, 1 << 10], 0);
-        assert_eq!(lit_keys(&lighting.frame(0, false)), [83]);
+        assert_eq!(lit_keys(&lighting.frame(0, false, false)), [83]);
         let held = [1, 0, 0, 0, 0, 0];
         lighting.clear(held);
         lighting.update(held, 50);
-        assert!(lit_keys(&lighting.frame(50, false)).is_empty());
+        assert!(lit_keys(&lighting.frame(50, false, false)).is_empty());
     }
 
     #[test]
@@ -214,10 +236,10 @@ mod tests {
         let mut lighting = Lighting::default();
         lighting.update([0x1ff, 0, 0, 0, 0, 0], 0);
         assert_eq!(
-            lit_keys(&lighting.frame(0, false)),
+            lit_keys(&lighting.frame(0, false, false)),
             [6, 7, 8, 9, 10, 11, 12, 13]
         );
-        assert_eq!(lit_keys(&lighting.frame(0, true)).len(), 9);
+        assert_eq!(lit_keys(&lighting.frame(0, true, false)).len(), 9);
     }
 
     fn decode(pixel: &[u8]) -> [u8; 3] {
