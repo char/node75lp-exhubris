@@ -1,0 +1,7 @@
+[package]
+name = "node75-touch-api"
+version = "0.1.0"
+edition = "2024"
+description = "Touch-bar gesture recognition and media IPC for the Node75 LP"
+
+[dependencies]

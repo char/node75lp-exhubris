@@ -569,6 +569,10 @@ name = "node75-matrix"
 version = "0.1.0"
 
 [[package]]
+name = "node75-touch-api"
+version = "0.1.0"
+
+[[package]]
 name = "node75-usb"
 version = "0.1.0"
 
