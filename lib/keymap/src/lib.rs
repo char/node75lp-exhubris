@@ -30,27 +30,55 @@ pub enum Action {
 
 use Action::{Key as K, Momentary, None as No, TapHold, Toggle, Transparent as Tr};
 
+impl Action {
+    /// [`PartialEq`] on `Action` is not `const`, and layer lookup needs it.
+    const fn same(self, other: Self) -> bool {
+        match (self, other) {
+            (No, No) | (Tr, Tr) => true,
+            (K(a), K(b)) | (Momentary(a), Momentary(b)) | (Toggle(a), Toggle(b)) => a == b,
+            (TapHold(key, layer), TapHold(other_key, other_layer)) => {
+                key == other_key && layer == other_layer
+            }
+            _ => false,
+        }
+    }
+}
+
 type Grid = [[Action; COLS]; ROWS];
+
+const BLANK: Grid = [[Tr; COLS]; ROWS];
+
+const fn layer<const N: usize>(mut grid: Grid, base: &Grid, swaps: [(Action, Action); N]) -> Grid {
+    // epic triple nested loop
+
+    let mut i = 0;
+    while i < N {
+        let (from, to) = swaps[i];
+        let mut found = false;
+        let mut row = 0;
+        'search: while row < ROWS {
+            let mut col = 0;
+            while col < COLS {
+                if base[row][col].same(from) {
+                    grid[row][col] = to;
+                    found = true;
+                    break 'search;
+                }
+                col += 1;
+            }
+            row += 1;
+        }
+        assert!(found, "layer: no base binding matches a swap source");
+        i += 1;
+    }
+    grid
+}
 
 #[derive(Clone, Copy)]
 struct Layer {
     grid: &'static Grid,
     /// Releasing a momentary activation of this layer clears the toggle.
     ends_with: Option<u8>,
-}
-
-const fn layer(grid: &'static Grid) -> Layer {
-    Layer {
-        grid,
-        ends_with: None,
-    }
-}
-
-const fn layer_ending(grid: &'static Grid, parent: u8) -> Layer {
-    Layer {
-        grid,
-        ends_with: Some(parent),
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -297,77 +325,83 @@ const EXT_LAYER: u8 = 2;
 const FKEY_LAYER: u8 = 3;
 
 const LAYERS: [Layer; 4] = [
-    layer(&BASE),
-    layer(&NAV),
-    layer_ending(&EXT, NAV_LAYER),
-    layer(&FKEY),
+    Layer {
+        grid: &BASE,
+        ends_with: None,
+    },
+    Layer {
+        grid: &NAV,
+        ends_with: None,
+    },
+    Layer {
+        grid: &EXT,
+        ends_with: Some(NAV_LAYER),
+    },
+    Layer {
+        grid: &FKEY,
+        ends_with: None,
+    },
 ];
+
+/// Tap for Caps Lock, hold for the function layer.
+const FN_KEY: Action = TapHold(CAPS, FKEY_LAYER);
 
 #[rustfmt::skip]
 const BASE: Grid = [
     [K(ESC),  K(F1),  K(F2),  K(F3),  K(F4),   K(F5),   K(F6),  K(F7),  K(F8),   K(F9),   K(F10),     K(F11),     K(F12),     K(PSCR), K(INS),  K(DEL) ],
     [K(GRV),  K(N1),  K(N2),  K(N3),  K(N4),   K(N5),   K(N6),  K(N7),  K(N8),   K(N9),   K(N0),      K(MINS),    K(EQL),     K(BSPC), No,      K(HOME)],
     [K(TAB),  K(Q),   K(W),   K(E),   K(R),    K(T),    K(Y),   K(U),   K(I),    K(O),    K(P),       K(LBRC),    K(RBRC),    K(BSLS), No,      K(END) ],
-    [TapHold(CAPS, FKEY_LAYER), K(A), K(S), K(D), K(F), K(G), K(H), K(J), K(keycodes::K), K(L), K(SCLN), K(QUOT), No, K(ENT), No, K(PGUP)],
+    [FN_KEY,  K(A),   K(S),   K(D),   K(F),    K(G),    K(H),   K(J),   K(keycodes::K), K(L), K(SCLN), K(QUOT), No, K(ENT), No, K(PGUP)],
     [K(LSFT), K(Z),   K(X),   K(C),   K(V),    K(B),    K(N),   K(M),   K(COMM), K(DOT),  K(SLSH),    No,         K(RSFT),    K(UP),   No,      K(PGDN)],
     [K(LCTL), K(LGUI), K(LALT), No,   No,     K(SPC),   No,     No,     No,      K(RALT), Momentary(NAV_LAYER), K(RCTL), K(LEFT), K(DOWN), No, K(RGHT)],
 ];
 
-#[rustfmt::skip]
-const NAV: Grid = {
-    let mut grid = [[Tr; COLS]; ROWS];
-    grid[0][0] = K(GRV);   // Esc
-    grid[1][13] = K(DEL);  // Backspace
-    grid[2][0] = K(PSCR);  // Tab
-    grid[2][2] = K(UP);    // W
-    grid[3][0] = Toggle(EXT_LAYER); // Caps
-    grid[3][1] = K(LEFT);  // A
-    grid[3][2] = K(DOWN);  // S
-    grid[3][3] = K(RGHT); // D
-    grid
-};
+const FKEY: Grid = layer(
+    BLANK,
+    &BASE,
+    [
+        (K(F1), K(F13)),
+        (K(F2), K(F14)),
+        (K(F3), K(F15)),
+        (K(F4), K(F16)),
+        (K(F5), K(F17)),
+        (K(F6), K(F18)),
+        (K(F7), K(F19)),
+        (K(F8), K(F20)),
+        (K(F9), K(F21)),
+        (K(F10), K(F22)),
+        (K(F11), K(F23)),
+        (K(F12), K(F24)),
+    ],
+);
 
-#[rustfmt::skip]
-const EXT: Grid = {
-    let mut grid = [[Tr; COLS]; ROWS];
-    grid[0][1] = K(F13);
-    grid[0][2] = K(F14);
-    grid[0][3] = K(F15);
-    grid[0][4] = K(F16);
-    grid[0][5] = K(F17);
-    grid[0][6] = K(F18);
-    grid[0][7] = K(F19);
-    grid[0][8] = K(F20);
-    grid[0][9] = K(F21);
-    grid[0][10] = K(F22);
-    grid[0][11] = K(F23);
-    grid[0][12] = K(F24);
-    grid[2][1] = K(INS);  // Q
-    grid[2][2] = K(PGUP); // W
-    grid[2][3] = K(SCRL); // E
-    grid[3][1] = K(HOME); // A
-    grid[3][2] = K(PGDN); // S
-    grid[3][3] = K(END);  // D
-    grid
-};
+const EXT: Grid = layer(
+    FKEY,
+    &BASE,
+    [
+        (K(Q), K(INS)),
+        (K(W), K(PGUP)),
+        (K(E), K(SCRL)),
+        (K(A), K(HOME)),
+        (K(S), K(PGDN)),
+        (K(D), K(END)),
+    ],
+);
 
-#[rustfmt::skip]
-const FKEY: Grid = {
-    let mut grid = [[Tr; COLS]; ROWS];
-    grid[0][1] = K(F13);
-    grid[0][2] = K(F14);
-    grid[0][3] = K(F15);
-    grid[0][4] = K(F16);
-    grid[0][5] = K(F17);
-    grid[0][6] = K(F18);
-    grid[0][7] = K(F19);
-    grid[0][8] = K(F20);
-    grid[0][9] = K(F21);
-    grid[0][10] = K(F22);
-    grid[0][11] = K(F23);
-    grid[0][12] = K(F24);
-    grid
-};
+const NAV: Grid = layer(
+    BLANK,
+    &BASE,
+    [
+        (K(ESC), K(GRV)),
+        (K(BSPC), K(DEL)),
+        (K(TAB), K(PSCR)),
+        (K(W), K(UP)),
+        (FN_KEY, Toggle(EXT_LAYER)),
+        (K(A), K(LEFT)),
+        (K(S), K(DOWN)),
+        (K(D), K(RGHT)),
+    ],
+);
 
 #[cfg(test)]
 mod tests {
@@ -481,12 +515,17 @@ mod tests {
             grid[0][1] = Momentary(1);
             grid
         };
-        const MODS: Grid = {
-            let mut grid = [[Tr; COLS]; ROWS];
-            grid[0][0] = K(LSFT);
-            grid
-        };
-        const LAYERS: [Layer; 2] = [layer(&BASE), layer(&MODS)];
+        const MODS: Grid = layer(BLANK, &BASE, [(K(A), K(LSFT))]);
+        const LAYERS: [Layer; 2] = [
+            Layer {
+                grid: &BASE,
+                ends_with: None,
+            },
+            Layer {
+                grid: &MODS,
+                ends_with: None,
+            },
+        ];
         let mut keymap = Keymap::with_layers(&LAYERS);
         let out = scan(&mut keymap, &[(0, 0), (0, 1)], 0);
         assert_eq!(last(&out).modifiers, 0b10);
@@ -499,19 +538,25 @@ mod tests {
         const BASE: Grid = {
             let mut grid = [[No; COLS]; ROWS];
             grid[0][0] = Momentary(1);
+            grid[0][1] = K(B);
             grid
         };
-        const NAV: Grid = {
-            let mut grid = [[Tr; COLS]; ROWS];
-            grid[0][1] = Toggle(2);
-            grid
-        };
-        const EXT: Grid = {
-            let mut grid = [[Tr; COLS]; ROWS];
-            grid[0][1] = K(CAPS);
-            grid
-        };
-        const LAYERS: [Layer; 3] = [layer(&BASE), layer(&NAV), layer_ending(&EXT, 1)];
+        const NAV: Grid = layer(BLANK, &BASE, [(K(B), Toggle(2))]);
+        const EXT: Grid = layer(BLANK, &BASE, [(K(B), K(CAPS))]);
+        const LAYERS: [Layer; 3] = [
+            Layer {
+                grid: &BASE,
+                ends_with: None,
+            },
+            Layer {
+                grid: &NAV,
+                ends_with: None,
+            },
+            Layer {
+                grid: &EXT,
+                ends_with: Some(1),
+            },
+        ];
         let mut keymap = Keymap::with_layers(&LAYERS);
         scan(&mut keymap, &[(0, 0)], 0);
         let out = scan(&mut keymap, &[(0, 0), (0, 1)], 1);
