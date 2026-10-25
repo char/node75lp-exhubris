@@ -8,3 +8,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Standalone, so it builds before `fetch` creates the vendor/ checkouts that
+# the firmware crates depend on.
+[workspace]

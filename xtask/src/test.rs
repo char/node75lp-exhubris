@@ -7,7 +7,7 @@ use crate::{Toolchain, command, run_command, upstream};
 pub fn test(root: &Path, toolchain: &Toolchain) -> Result<()> {
     upstream::ensure_upstreams(root, false)?;
 
-    // Host tests for this repo's lib crates (includes xtask itself).
+    // Host tests for this repo's lib crates.
     run_command(
         command(toolchain, &toolchain.cargo)
             .current_dir(root)
