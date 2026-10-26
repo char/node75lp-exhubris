@@ -356,10 +356,25 @@ const BASE: Grid = [
     [K(LCTL), K(LGUI), K(LALT), No,   No,     K(SPC),   No,     No,     No,      K(RALT), Momentary(NAV_LAYER), K(RCTL), K(LEFT), K(DOWN), No, K(RGHT)],
 ];
 
+/// Hold caps for the function keys: the number row becomes F1–F12, keeping
+/// the F row's arrangement (`-` and `=` carry F11 and F12), and the F row
+/// itself becomes F13–F24.
 const FKEY: Grid = layer(
     BLANK,
     &BASE,
     [
+        (K(N1), K(F1)),
+        (K(N2), K(F2)),
+        (K(N3), K(F3)),
+        (K(N4), K(F4)),
+        (K(N5), K(F5)),
+        (K(N6), K(F6)),
+        (K(N7), K(F7)),
+        (K(N8), K(F8)),
+        (K(N9), K(F9)),
+        (K(N0), K(F10)),
+        (K(MINS), K(F11)),
+        (K(EQL), K(F12)),
         (K(F1), K(F13)),
         (K(F2), K(F14)),
         (K(F3), K(F15)),
