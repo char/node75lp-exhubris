@@ -1,6 +1,9 @@
 //! HID 1.11 report descriptors, written as short items and encoded at compile time.
 
-use crate::bytes::Bytes;
+use crate::{
+    bytes::Bytes,
+    report::{FIRST_USAGE, LAST_USAGE},
+};
 
 #[derive(Clone, Copy)]
 #[repr(u16)]
@@ -40,8 +43,6 @@ const KEYBOARD_USAGE: u16 = 0x06;
 const CONSUMER_CONTROL: u16 = 0x01;
 const TELEMETRY: u16 = 0x01;
 
-const NO_EVENT: u16 = 0x00;
-const F24: u16 = 0x73;
 const LEFT_CONTROL: u16 = 0xe0;
 const RIGHT_GUI: u16 = 0xe7;
 const NUM_LOCK: u16 = 0x01;
@@ -52,8 +53,9 @@ pub const TELEMETRY_BYTES: usize = 16;
 /// One output bit per LED from `NUM_LOCK` to `KANA`.
 pub const LED_MASK: u8 = (1 << (KANA - NUM_LOCK + 1)) - 1;
 
-/// Boot-compatible: modifier bits, a reserved byte and six key slots, without
-/// report IDs. The feature report carries diagnostic telemetry.
+/// Modifier bits and a bitmap from A through F24, without report IDs.
+/// Boot protocol uses its fixed eight-byte format instead of this descriptor.
+/// The feature report carries diagnostic telemetry.
 const KEYBOARD_ITEMS: &[Item] = &[
     UsagePage(Page::GenericDesktop),
     Usage(KEYBOARD_USAGE),
@@ -66,9 +68,6 @@ const KEYBOARD_ITEMS: &[Item] = &[
     ReportSize(1),
     ReportCount(8),
     Input(VARIABLE),
-    ReportCount(1),
-    ReportSize(8),
-    Input(CONSTANT),
     ReportCount(5),
     ReportSize(1),
     UsagePage(Page::Led),
@@ -78,14 +77,14 @@ const KEYBOARD_ITEMS: &[Item] = &[
     ReportCount(1),
     ReportSize(3),
     Output(CONSTANT),
-    ReportCount(6),
-    ReportSize(8),
+    ReportCount(LAST_USAGE - FIRST_USAGE + 1),
+    ReportSize(1),
     LogicalMinimum(0),
-    LogicalMaximum(F24 as i32),
+    LogicalMaximum(1),
     UsagePage(Page::Keyboard),
-    UsageMinimum(NO_EVENT),
-    UsageMaximum(F24),
-    Input(ARRAY),
+    UsageMinimum(FIRST_USAGE as u16),
+    UsageMaximum(LAST_USAGE as u16),
+    Input(VARIABLE),
     UsagePage(Page::Vendor),
     Usage(TELEMETRY),
     LogicalMinimum(0),

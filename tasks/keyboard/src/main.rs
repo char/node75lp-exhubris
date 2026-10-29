@@ -4,7 +4,7 @@
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
 use node75_keyboard_core::Debouncer;
-use node75_usb::{Action, Device};
+use node75_usb::{Action, Device, Report};
 
 mod usb_hw;
 
@@ -86,6 +86,7 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
                 Action::Address(address) => hardware.set_address(address),
                 Action::Configure(configured) => hardware.configure(configured),
                 Action::Halt(endpoint, halted) => hardware.set_halt(endpoint, halted),
+                Action::CancelKeyboardReport => hardware.cancel_keyboard_report(),
                 Action::Stall => hardware.stall_control(),
             }
             unsafe { write_volatile(addr_of_mut!(USB_LEDS), device.leds()) };
@@ -96,16 +97,13 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
             now = clock.millis();
             keys = debounce.update(raw, now);
             keymap.update(keys, now, |resolved| {
-                device.set_report(node75_keyboard_core::report(
-                    resolved.modifiers,
-                    resolved.usages(),
-                ));
+                device.set_report(Report::new(resolved.modifiers, resolved.usages()));
             });
             last_scan = now;
             media_bridge::receive(&mut device, &mut touching);
         }
         if let Some(report) = device.report_due(now)
-            && hardware.transmit(1, &report)
+            && hardware.transmit(1, device.report_packet(report).as_slice())
         {
             device.report_queued(report);
         }

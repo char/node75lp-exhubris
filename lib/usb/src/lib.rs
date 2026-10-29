@@ -1,8 +1,7 @@
 //! USB HID device state machine: a boot/report keyboard on interface 0
 //! (EP1) and a consumer-control interface on interface 1 (EP2) for media
 //! keys. Descriptors, control transfers, report scheduling. Independent
-//! of MMIO; the register driver is in the keyboard task. Keyboard report
-//! policy follows char/q65-max-hubris; 6KRO in both protocols.
+//! of MMIO; the register driver is in the keyboard task.
 
 #![no_std]
 
@@ -12,6 +11,7 @@ extern crate std;
 mod bytes;
 mod descriptors;
 mod hid;
+mod report;
 
 use descriptors::{
     CONFIGURATION, CONFIGURATION_TYPE, CONFIGURATION_VALUE, CONSUMER_HID, CONTROL_MAX_PACKET,
@@ -21,8 +21,7 @@ use descriptors::{
 use heapless::Deque;
 use hid::{LED_MASK, TELEMETRY_BYTES};
 
-/// A boot-protocol keyboard report: modifiers, a reserved byte and six key slots.
-pub type Report = [u8; 8];
+pub use report::Report;
 
 /// The HID interfaces, in configuration descriptor order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,10 +133,12 @@ pub enum Action {
     Configure(bool),
     /// Endpoint address (0x81 or 0x82) and new halt state.
     Halt(u8, bool),
+    /// Disarm EP1 without changing its data toggle when switching report formats.
+    CancelKeyboardReport,
     Stall,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Protocol {
     Boot = 0,
     #[default]
@@ -239,6 +240,10 @@ impl Device {
             // rather than replaying stale input or leaving a released key down.
             self.pending.clear();
         }
+    }
+
+    pub fn report_packet(&self, report: Report) -> Packet {
+        report.packet(self.protocol)
     }
 
     pub fn report_due(&self, now: u32) -> Option<Report> {
@@ -437,8 +442,8 @@ impl Device {
                 self.status(Commit::Halt(Interface::Consumer, false))
             }
             (CLASS_INTERFACE_IN, GET_REPORT, INPUT_REPORT, KEYBOARD, _) if self.configured => {
-                let report = self.report;
-                self.read(&report, length)
+                let packet = self.report_packet(self.report);
+                self.read(packet.as_slice(), length)
             }
             (CLASS_INTERFACE_IN, GET_REPORT, FEATURE_REPORT, KEYBOARD, _) if self.configured => {
                 let telemetry = self.telemetry;
@@ -571,10 +576,13 @@ impl Device {
                     }
                     Action::Halt(interface.endpoint_address(), halted)
                 }
+                Commit::Protocol(protocol) if self.protocol == protocol => Action::None,
                 Commit::Protocol(protocol) => {
                     self.protocol = protocol;
+                    self.in_flight = None;
                     self.acknowledged = None;
-                    Action::None
+                    self.pending.clear();
+                    Action::CancelKeyboardReport
                 }
                 Commit::ConsumerIdle(idle) => {
                     self.consumer_idle = idle;
@@ -599,7 +607,7 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::vec::Vec;
+    use std::{vec, vec::Vec};
 
     fn setup(kind: u8, request: u8, value: u16, index: u16, length: u16) -> [u8; 8] {
         let [vl, vh] = value.to_le_bytes();
@@ -657,14 +665,17 @@ mod tests {
             types.push(descriptor[1]);
             match descriptor[1] {
                 4 => interfaces.push(descriptor[2]),
-                5 => endpoints.push(descriptor[2]),
+                5 => endpoints.push((
+                    descriptor[2],
+                    u16::from_le_bytes([descriptor[4], descriptor[5]]),
+                )),
                 _ => {}
             }
             rest = tail;
         }
         assert_eq!(types, [2, 4, 0x21, 5, 4, 0x21, 5]);
         assert_eq!(interfaces, [0, 1]);
-        assert_eq!(endpoints, [0x81, 0x82]);
+        assert_eq!(endpoints, [(0x81, 15), (0x82, 2)]);
         assert_eq!(
             read_all(&mut device, setup(0x81, 6, 0x2200, 0, 255)),
             hid::KEYBOARD
@@ -693,8 +704,10 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_declares_exactly_eight_input_bytes_and_one_led_byte_without_ids() {
-        let (mut size, mut count, mut input, mut output, mut feature) = (0, 0, 0, 0, 0);
+    fn descriptor_declares_nkro_input_and_one_led_byte_without_ids() {
+        let (mut page, mut first, mut last, mut size, mut count) = (0, 0, 0, 0, 0);
+        let (mut input, mut output, mut feature) = (0, 0, 0);
+        let mut fields = Vec::new();
         let mut bytes: &[u8] = &hid::KEYBOARD;
         while !bytes.is_empty() {
             let len = match bytes[0] & 3 {
@@ -702,19 +715,29 @@ mod tests {
                 x => x as usize,
             };
             let tag = bytes[0] & 0xfc;
-            let value = if len > 0 { bytes[1] as usize } else { 0 };
+            let mut value = 0;
+            for (i, byte) in bytes[1..1 + len].iter().enumerate() {
+                value |= usize::from(*byte) << (8 * i);
+            }
             match tag {
+                0x04 => page = value,
+                0x18 => first = value,
+                0x28 => last = value,
                 0x74 => size = value,
                 0x94 => count = value,
-                0x80 => input += size * count,
+                0x80 => {
+                    fields.push((page, first, last, size, count, value));
+                    input += size * count;
+                }
                 0x90 => output += size * count,
                 0xb0 => feature += size * count,
-                0x84 => panic!("boot-compatible report must not have an ID"),
+                0x84 => panic!("keyboard report must not have an ID"),
                 _ => {}
             }
             bytes = &bytes[1 + len..];
         }
-        assert_eq!((input, output, feature), (64, 8, 128));
+        assert_eq!(fields, [(7, 0xe0, 0xe7, 1, 8, 2), (7, 4, 0x73, 1, 112, 2)]);
+        assert_eq!((input, output, feature), (120, 8, 128));
     }
 
     #[test]
@@ -799,7 +822,7 @@ mod tests {
         device.setup(setup(0, 9, 1, 0, 0));
         assert_eq!(device.report_due(0), None);
         assert_eq!(device.in_complete(0, 0), Action::Configure(true));
-        assert_eq!(device.report_due(0), Some([0; 8]));
+        assert_eq!(device.report_due(0), Some(Report::default()));
     }
 
     #[test]
@@ -828,7 +851,7 @@ mod tests {
         ] {
             assert_eq!(device.setup(packet), Action::Stall, "{packet:?}");
         }
-        assert_eq!(device.report_due(0), Some([0; 8]));
+        assert_eq!(device.report_due(0), Some(Report::default()));
     }
 
     #[test]
@@ -851,33 +874,142 @@ mod tests {
     }
 
     #[test]
-    fn boot_and_report_protocols_both_return_six_kro() {
+    fn boot_and_report_protocols_encode_the_same_keys_differently() {
         let mut device = configured();
-        let report = [2, 0, 4, 5, 6, 0, 0, 0];
+        let report = Report::new(2, [4, 5, 6]);
         device.set_report(report);
-        for protocol in [0, 1] {
+        for (protocol, expected) in [
+            (0, vec![2, 0, 4, 5, 6, 0, 0, 0]),
+            (1, vec![2, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ] {
             device.setup(setup(0x21, 11, protocol, 0, 0));
-            device.in_complete(0, 0);
+            assert_eq!(device.in_complete(0, 0), Action::CancelKeyboardReport);
             assert_eq!(
                 data(device.setup(setup(0xa1, 3, 0, 0, 1))),
                 [protocol as u8]
             );
-            assert_eq!(data(device.setup(setup(0xa1, 1, 0x0100, 0, 8))), report);
+            assert_eq!(data(device.setup(setup(0xa1, 1, 0x0100, 0, 64))), expected);
+            let due = device.report_due(0).unwrap();
+            assert_eq!(device.report_packet(due).as_slice(), expected);
+            assert_eq!(
+                data(device.setup(setup(0xa1, 1, 0x0100, 0, 3))),
+                expected[..3]
+            );
         }
+    }
+
+    #[test]
+    fn nkro_chords_release_individually_and_boot_recovers_from_rollover() {
+        let mut device = configured();
+        for protocol in [1, 0] {
+            device.setup(setup(0x21, 11, protocol, 0, 0));
+            device.in_complete(0, 0);
+            for (usages, expected) in [
+                (
+                    4..=10,
+                    if protocol == 1 {
+                        vec![2, 0x7f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                    } else {
+                        vec![2, 0, 1, 1, 1, 1, 1, 1]
+                    },
+                ),
+                (
+                    5..=10,
+                    if protocol == 1 {
+                        vec![2, 0x7e, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                    } else {
+                        vec![2, 0, 5, 6, 7, 8, 9, 10]
+                    },
+                ),
+                (
+                    0..=0,
+                    if protocol == 1 {
+                        vec![2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                    } else {
+                        vec![2, 0, 0, 0, 0, 0, 0, 0]
+                    },
+                ),
+            ] {
+                device.set_report(Report::new(2, usages));
+                let report = device.report_due(0).unwrap();
+                assert_eq!(device.report_packet(report).as_slice(), expected);
+                assert_eq!(data(device.setup(setup(0xa1, 1, 0x0100, 0, 64))), expected);
+                device.report_queued(report);
+                device.in_complete(1, 0);
+                assert_eq!(device.report_due(0), None);
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_switch_cancels_old_snapshots_and_resends_current_keys() {
+        let mut device = configured();
+        let held = Report::new(2, 4..=10);
+        device.set_report(held);
+        device.report_queued(held);
+        device.set_report(Report::default());
+        device.set_report(Report::new(0, [0x73]));
+
+        device.setup(setup(0x21, 11, 0, 0, 0));
+        assert_eq!(device.report_due(0), None);
+        assert_eq!(device.in_complete(0, 0), Action::CancelKeyboardReport);
+        device.in_complete(1, 0); // A canceled transfer cannot acknowledge the new state.
+        let current = device.report_due(0).unwrap();
+        assert_eq!(current, Report::new(0, [0x73]));
+        assert_eq!(
+            device.report_packet(current).as_slice(),
+            [0, 0, 0x73, 0, 0, 0, 0, 0]
+        );
+        device.report_queued(current);
+        device.in_complete(1, 0);
+        assert_eq!(device.report_due(0), None);
+
+        device.reset();
+        device.setup(setup(0, 5, 7, 0, 0));
+        device.in_complete(0, 0);
+        device.setup(setup(0, 9, 1, 0, 0));
+        device.in_complete(0, 0);
+        assert_eq!(data(device.setup(setup(0xa1, 3, 0, 0, 1))), [1]);
+        assert_eq!(
+            device
+                .report_packet(device.report_due(0).unwrap())
+                .as_slice(),
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80]
+        );
+    }
+
+    #[test]
+    fn aborted_and_unchanged_protocol_requests_preserve_pending_taps() {
+        let mut device = configured();
+        let chord = Report::new(2, 4..=10);
+        device.set_report(chord);
+        device.report_queued(chord);
+        device.set_report(Report::default());
+
+        device.setup(setup(0x21, 11, 0, 0, 0));
+        device.setup(setup(0xa1, 3, 0, 0, 1));
+        assert_eq!(device.in_complete(0, 0), Action::None);
+        assert_eq!(data(device.setup(setup(0xa1, 3, 0, 0, 1))), [1]);
+        device.setup(setup(0x21, 11, 1, 0, 0));
+        assert_eq!(device.in_complete(0, 0), Action::None);
+        assert_eq!(device.report_due(0), None);
+        device.in_complete(1, 0);
+        let released = device.report_due(0).unwrap();
+        assert_eq!(device.report_packet(released).as_slice(), [0; 15]);
     }
 
     #[test]
     fn slow_host_keeps_dma_snapshot_then_gets_latest_state() {
         let mut device = configured();
-        let down = [0, 0, 4, 0, 0, 0, 0, 0];
+        let down = Report::new(0, [4]);
         device.set_report(down);
         assert_eq!(device.report_due(0), Some(down));
         device.report_queued(down);
-        device.set_report([0; 8]);
+        device.set_report(Report::default());
         assert_eq!(device.report_due(100), None);
         device.in_complete(1, 100);
-        assert_eq!(device.report_due(100), Some([0; 8]));
-        device.report_queued([0; 8]);
+        assert_eq!(device.report_due(100), Some(Report::default()));
+        device.report_queued(Report::default());
         device.in_complete(1, 101);
         assert_eq!(device.report_due(1000), None);
     }
@@ -885,15 +1017,15 @@ mod tests {
     #[test]
     fn complete_key_taps_survive_a_busy_endpoint() {
         let mut device = configured();
-        device.report_queued([0; 8]);
-        let caps = [0, 0, 0x39, 0, 0, 0, 0, 0];
-        let a = [0, 0, 4, 0, 0, 0, 0, 0];
-        for report in [caps, [0; 8], a, [0; 8]] {
+        device.report_queued(Report::default());
+        let caps = Report::new(0, [0x39]);
+        let a = Report::new(0, [4]);
+        for report in [caps, Report::default(), a, Report::default()] {
             device.set_report(report);
         }
         assert_eq!(device.report_due(0), None);
         device.in_complete(1, 1);
-        for report in [caps, [0; 8], a, [0; 8]] {
+        for report in [caps, Report::default(), a, Report::default()] {
             assert_eq!(device.report_due(1), Some(report));
             device.report_queued(report);
             assert_eq!(device.report_due(1), None);
@@ -905,13 +1037,13 @@ mod tests {
     #[test]
     fn keyboard_overflow_eventually_delivers_the_current_physical_state() {
         let mut device = configured();
-        let held = [2, 0, 4, 0, 0, 0, 0, 0];
+        let held = Report::new(2, [4]);
         device.set_report(held);
         device.report_queued(held);
         for usage in (4..30).cycle().take(200) {
-            device.set_report([0, 0, usage, 0, 0, 0, 0, 0]);
+            device.set_report(Report::new(0, [usage]));
         }
-        device.set_report([0; 8]);
+        device.set_report(Report::default());
         device.in_complete(1, 0);
         let mut last = held;
         let mut sent = 0;
@@ -922,17 +1054,17 @@ mod tests {
             last = report;
             sent += 1;
         }
-        assert_eq!(last, [0; 8]);
+        assert_eq!(last, Report::default());
     }
 
     #[test]
     fn suspended_keyboard_discards_taps_but_keeps_physically_held_keys() {
         let mut device = configured();
-        let a = [0, 0, 4, 0, 0, 0, 0, 0];
-        let shift = [2, 0, 0, 0, 0, 0, 0, 0];
+        let a = Report::new(0, [4]);
+        let shift = Report::new(2, []);
         device.set_report(a);
         device.report_queued(a);
-        device.set_report([0; 8]);
+        device.set_report(Report::default());
         device.set_suspended(true);
         device.set_report(shift);
         device.set_suspended(false);
@@ -945,12 +1077,12 @@ mod tests {
     #[test]
     fn idle_uses_four_ms_units_and_wraps() {
         let mut device = configured();
-        device.report_queued([0; 8]);
+        device.report_queued(Report::default());
         device.in_complete(1, u32::MAX - 5);
         device.setup(setup(0x21, 10, 2 << 8, 0, 0));
         device.in_complete(0, u32::MAX - 5);
         assert_eq!(device.report_due(1), None);
-        assert_eq!(device.report_due(2), Some([0; 8]));
+        assert_eq!(device.report_due(2), Some(Report::default()));
         assert_eq!(data(device.setup(setup(0xa1, 2, 0, 0, 1))), [2]);
         device.setup(setup(0x21, 10, 0, 0, 0));
         device.in_complete(0, 3);
@@ -960,18 +1092,18 @@ mod tests {
     #[test]
     fn halt_unconfigure_suspend_resume_and_reset() {
         let mut device = configured();
-        device.report_queued([0; 8]);
+        device.report_queued(Report::default());
         device.setup(setup(2, 3, 0, 0x81, 0));
         assert_eq!(device.in_complete(0, 0), Action::Halt(0x81, true));
         assert_eq!(device.report_due(0), None);
         assert_eq!(data(device.setup(setup(0x82, 0, 0, 0x81, 2))), [1, 0]);
         device.setup(setup(2, 1, 0, 0x81, 0));
         assert_eq!(device.in_complete(0, 0), Action::Halt(0x81, false));
-        assert_eq!(device.report_due(0), Some([0; 8]));
+        assert_eq!(device.report_due(0), Some(Report::default()));
         device.set_suspended(true);
         assert_eq!(device.report_due(0), None);
         device.set_suspended(false);
-        assert_eq!(device.report_due(0), Some([0; 8]));
+        assert_eq!(device.report_due(0), Some(Report::default()));
         device.setup(setup(0, 9, 0, 0, 0));
         assert_eq!(device.in_complete(0, 0), Action::Configure(false));
         assert_eq!(device.report_due(0), None);
@@ -1008,7 +1140,7 @@ mod tests {
         device.setup(setup(2, 3, 0, 0x82, 0));
         assert_eq!(device.in_complete(0, 0), Action::Halt(0x82, true));
         assert_eq!(device.consumer_due(0), None);
-        assert_eq!(device.report_due(0), Some([0; 8]));
+        assert_eq!(device.report_due(0), Some(Report::default()));
         assert_eq!(data(device.setup(setup(0x82, 0, 0, 0x82, 2))), [1, 0]);
         device.setup(setup(2, 1, 0, 0x82, 0));
         assert_eq!(device.in_complete(0, 0), Action::Halt(0x82, false));

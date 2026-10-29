@@ -4,6 +4,9 @@ keyboard firmware in Rust for the NuPhy Node75 LP (WCH CH582) :D
 
 `cargo xtask fetch` grabs hubris and exhubris and patches them and puts them under `vendor/`
 
+NKRO over USB, with a 6KRO fallback when the host selects boot protocol
+(for example, in a BIOS).
+
 ## building
 
 ```shell

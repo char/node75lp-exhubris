@@ -59,7 +59,7 @@ const UEP_T_NAK: u8 = 0x02;
 const UEP_T_STALL: u8 = 0x03;
 const UEP_AUTO_TOG: u8 = 0x10;
 const EP0_MAX: usize = 64;
-const EP1_MAX: usize = 8;
+const EP1_MAX: usize = node75_usb::Report::LEN;
 const EP2_MAX: usize = 2;
 const UIF_EVENTS: u8 = UIF_BUS_RST | UIF_TRANSFER | UIF_SUSPEND;
 
@@ -389,6 +389,18 @@ impl Usb {
         }
         *busy = true;
         true
+    }
+
+    pub fn cancel_keyboard_report(&mut self) {
+        if !self.ep1_busy {
+            return;
+        }
+        unsafe {
+            let ctrl = read_volatile(UEP1_CTRL);
+            write_volatile(UEP1_CTRL, (ctrl & !UEP_T_RES) | UEP_T_NAK);
+            write_volatile(UEP1_T_LEN, 0);
+        }
+        self.ep1_busy = false;
     }
 
     pub fn set_address(&mut self, address: u8) {

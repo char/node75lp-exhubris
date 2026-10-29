@@ -1,35 +1,14 @@
-//! Matrix state, debounce and HID report construction. Pure logic; no
-//! registers.
+//! Matrix state and debounce. Pure logic; no registers.
 
 #![no_std]
 
 pub mod keycodes;
-
-use node75_usb::Report;
 
 pub const ROWS: usize = 6;
 pub const COLS: usize = 16;
 
 /// One bit per column, per row: bit `c` of `matrix[r]` is position (r, c).
 pub type Matrix = [u16; ROWS];
-
-/// Build a 6KRO report from a modifier bitmask (bit `i` is usage `0xe0 + i`)
-/// and the other pressed usages, in order. More than six keys yields HID
-/// ErrorRollOver in every slot rather than dropping keys arbitrarily.
-pub fn report(modifiers: u8, usages: impl IntoIterator<Item = u8>) -> Report {
-    let mut report = [0; 8];
-    report[0] = modifiers;
-    let mut slot = 2;
-    for usage in usages {
-        if slot == report.len() {
-            report[2..].fill(1);
-            break;
-        }
-        report[slot] = usage;
-        slot += 1;
-    }
-    report
-}
 
 #[derive(Default)]
 pub struct Debouncer {
@@ -58,25 +37,7 @@ impl Debouncer {
 
 #[cfg(test)]
 mod tests {
-    use super::{keycodes::*, *};
-
-    #[test]
-    fn modifiers_and_keys_fill_their_fields() {
-        assert_eq!(report(0b10, [A]), [2, 0, A, 0, 0, 0, 0, 0]);
-        assert_eq!(report(0, [SPC]), [0, 0, SPC, 0, 0, 0, 0, 0]);
-        assert_eq!(report(0b1_1101, []), [0x1d, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(report(0, []), [0; 8]);
-    }
-
-    #[test]
-    fn six_keys_then_rollover() {
-        let six = [N1, N2, N3, N4, N5, N6];
-        assert_eq!(report(2, six), [2, 0, N1, N2, N3, N4, N5, N6]);
-        assert_eq!(
-            report(2, six.into_iter().chain([N7])),
-            [2, 0, 1, 1, 1, 1, 1, 1]
-        );
-    }
+    use super::*;
 
     #[test]
     fn bounce_is_filtered_per_key_on_both_edges() {

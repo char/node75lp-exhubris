@@ -317,9 +317,6 @@ dependencies = [
 [[package]]
 name = "node75-keyboard-core"
 version = "0.1.0"
-dependencies = [
- "node75-usb",
-]
 
 [[package]]
 name = "node75-keymap"

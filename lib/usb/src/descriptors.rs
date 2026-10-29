@@ -62,12 +62,7 @@ const INTERFACE_LEN: usize = 9 + 9 + 7;
 const fn interface(interface: Interface) -> [u8; INTERFACE_LEN] {
     // The boot keyboard subclass and protocol let BIOSes drive the keyboard.
     let (subclass, protocol, hid, max_packet) = match interface {
-        Interface::Keyboard => (
-            BOOT_SUBCLASS,
-            KEYBOARD_PROTOCOL,
-            KEYBOARD_HID,
-            size_of::<Report>(),
-        ),
+        Interface::Keyboard => (BOOT_SUBCLASS, KEYBOARD_PROTOCOL, KEYBOARD_HID, Report::LEN),
         Interface::Consumer => (0, 0, CONSUMER_HID, size_of::<u16>()),
     };
     let mut out = Bytes::new();
