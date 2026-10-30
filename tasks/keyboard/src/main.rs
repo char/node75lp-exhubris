@@ -61,11 +61,14 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
         keys: [0; 6],
         sampled_at: None,
         touching: false,
+        now: 0,
     };
     keyboard.device.set_telemetry(telemetry);
     let mut incoming = [MaybeUninit::uninit(); NODE_75_KEYBOARD_BUFFER_SIZE];
     loop {
-        let now = clock.millis();
+        let time = userlib::sys_get_timer().now;
+        let now = time as u32;
+        keyboard.now = now;
         let device = &mut keyboard.device;
         // A continuously active host must not prevent other tasks from running.
         for _ in 0..16 {
@@ -124,7 +127,7 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
         {
             keyboard.release_inputs();
         }
-        userlib::sys_set_timer(Some(userlib::sys_get_timer().now + 1), POLL_TIMER);
+        userlib::sys_set_timer(Some(time + 1), POLL_TIMER);
         idyll_runtime::dispatch_or_event(&mut keyboard, FAULT | POLL_TIMER, &mut incoming);
     }
 }
@@ -135,6 +138,7 @@ struct Keyboard {
     keys: Matrix,
     sampled_at: Option<u32>,
     touching: bool,
+    now: u32,
 }
 
 impl Keyboard {
@@ -179,7 +183,7 @@ impl Node75Keyboard for Keyboard {
     fn set_matrix(&mut self, meta: Meta, keys: [u16; 6]) -> Result<(), ReplyFaultReason> {
         expect(&meta, SLOTS.board)?;
         self.keys = keys;
-        self.sampled_at = Some(userlib::sys_get_timer().now as u32);
+        self.sampled_at = Some(self.now);
         Ok(())
     }
 
@@ -198,7 +202,7 @@ impl Node75Keyboard for Keyboard {
         expect(&meta, SLOTS.lighting)?;
         Ok(LightingState {
             keys: self.keys,
-            now: userlib::sys_get_timer().now as u32,
+            now: self.now,
             active: self.device.active(),
             leds: self.device.leds(),
             touching: self.touching,

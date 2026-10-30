@@ -20,6 +20,9 @@ pub struct Debouncer {
 impl Debouncer {
     /// Accept a key once its sampled state has been unchanged for 5 ms.
     pub fn update(&mut self, raw: Matrix, now: u32) -> Matrix {
+        if raw == self.candidate && raw == self.stable {
+            return self.stable;
+        }
         for (row, raw) in raw.into_iter().enumerate() {
             for column in 0..COLS {
                 let bit = 1 << column;
