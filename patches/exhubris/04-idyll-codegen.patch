@@ -1,0 +1,50 @@
+fix lease permissions, no-argument methods, unit results, and array lengths in Idyll code generation
+
+diff --git a/tools/build/src/idl.rs b/tools/build/src/idl.rs
+index 53775213591a2180d6f11f0321aa591ef88647eb..05eb953e4a9dbb7d85e31a20b46d40388498b994 100644
+--- a/tools/build/src/idl.rs
++++ b/tools/build/src/idl.rs
+@@ -474,6 +474,7 @@ fn parse_value_type(s: &str) -> miette::Result<ValueType> {
+     // Handle the primitive cases
+     let s = s.trim();
+     match s {
++        "()" => Ok(ValueType::Tuple(vec![])),
+         "u8" => Ok(ValueType::Prim(PrimType::U8)),
+         "u16" => Ok(ValueType::Prim(PrimType::U16)),
+         "u32" => Ok(ValueType::Prim(PrimType::U32)),
+diff --git a/tools/build/src/idl/codegen.rs b/tools/build/src/idl/codegen.rs
+index dcbf6520b57d4da0df8167ccb8f690fab78cccb6..289b9783cc655a9c689f46572bcad88a9cf8f263 100644
+--- a/tools/build/src/idl/codegen.rs
++++ b/tools/build/src/idl/codegen.rs
+@@ -209,11 +209,11 @@ pub fn generate_client_method(
+         let method_name = match (lease_def.read, lease_def.write) {
+             (false, false) => format_ident!("no_access"),
+             (true, false) => format_ident!("read_only"),
+-            (true, true) => format_ident!("write_only"),
+-            (false, true) => format_ident!("read_write"),
++            (false, true) => format_ident!("write_only"),
++            (true, true) => format_ident!("read_write"),
+         };
+         let as_bytes = if lease_def.write {
+-            quote! { as_bytes_mut }
++            quote! { as_mut_bytes }
+         } else {
+             quote! { as_bytes }
+         };
+@@ -367,6 +367,7 @@ pub fn generate_type(
+         }
+         ValueType::Array(ty, len) => {
+             let ty = generate_type(ty)?;
++            let len = Literal::usize_unsuffixed(*len as usize);
+             Ok(quote! { [#ty; #len] })
+         }
+         ValueType::Named { name, generics } => {
+@@ -449,7 +450,7 @@ fn generate_server_op_enum(iface: &InterfaceDef) -> miette::Result<(Ident, proc_
+             })
+         }).collect::<miette::Result<Vec<_>>>()?;
+         Ok(quote::quote! {
+-            #(#args)+*
++            0usize #(+ #args)*
+         })
+     }).collect::<miette::Result<Vec<_>>>()?;
+     let reply_cases = iface.methods.iter().map(|(name, def)| {
