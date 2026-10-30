@@ -10,6 +10,7 @@ use crate::board::Clock;
 
 const SPI: usize = 0x4000_4000;
 const FRAME_MS: u32 = 8;
+pub const POLL_MS: u32 = FRAME_MS / 2;
 
 #[repr(C, align(4))]
 struct Frame([u8; FRAME_BYTES]);

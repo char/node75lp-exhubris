@@ -47,7 +47,7 @@ fn main() -> ! {
             lighting.frame(state.now, state.leds & 2 != 0, state.touching)
         });
         let now = userlib::sys_get_timer().now;
-        userlib::sys_set_timer(Some(now + 1), FRAME_TICK);
+        userlib::sys_set_timer(Some(now + u64::from(lighting_hw::POLL_MS)), FRAME_TICK);
         userlib::sys_recv_notification(FRAME_TICK);
     }
 }
