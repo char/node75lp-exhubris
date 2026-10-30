@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["kernel", "tasks/keyboard", "tasks/lighting", "tasks/touch", "lib/keymap", "lib/keyboard-core", "lib/matrix", "lib/usb", "lib/lighting-api", "lib/lighting-effects", "lib/touch-api"]
-default-members = ["lib/keymap", "lib/keyboard-core", "lib/usb", "lib/lighting-api", "lib/lighting-effects", "lib/touch-api"]
+members = ["kernel", "tasks/keyboard", "tasks/lighting", "tasks/touch", "tasks/idle", "tasks/board", "lib/board-api", "lib/keymap", "lib/keyboard-core", "lib/matrix", "lib/usb", "lib/lighting-api", "lib/lighting-effects", "lib/touch-api"]
+default-members = ["lib/board-api", "lib/keymap", "lib/keyboard-core", "lib/usb", "lib/lighting-api", "lib/lighting-effects", "lib/touch-api"]
 # Host crates only: kernel/ and tasks/* build solely through hubris-build
 # for riscv32imac, so bare cargo commands at the root must not select them.
 # Generated upstream checkouts have their own workspaces; without this,

@@ -4,7 +4,6 @@
 use hubris_task_slots::SLOTS;
 use node75_touch_api::{CONTACT, Gestures, MEDIA_KEY, MediaEvent, encode_contact};
 
-mod i2c;
 mod sensor;
 
 use sensor::{Sensor, Service};
@@ -15,7 +14,7 @@ const PROBE_MS: u32 = 500;
 
 #[unsafe(export_name = "main")]
 fn main() -> ! {
-    let mut sensor = unsafe { Sensor::new() };
+    let mut sensor = Sensor::new();
     let mut gestures = Gestures::default();
     let mut last_sample = None;
     let mut last_probe = 0u32;

@@ -12,8 +12,8 @@ pub fn observer() -> impl FnMut(State) {
             return;
         }
         last_update = Some(update);
-        // Only this receiver can unblock the sender. Never make USB wait
-        // for a faulted or unresponsive renderer.
+        // This highest-priority task cannot be preempted by its client between
+        // the status check and receive. Never wait for the renderer.
         let status = kipc::read_task_status(usize::from(SLOTS.lighting.task_index()));
         if !replies::is_sending_to_us(status) {
             return;

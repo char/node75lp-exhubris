@@ -29,11 +29,12 @@ fn main() -> ! {
         0x80 => 32_000_000,
         _ => panic!("unsupported inherited clock"),
     };
-    let mut lights = unsafe { lighting_hw::Lights::new(&board::Clock(frequency)) };
+    let gpio = node75_board_api::Node75Board::from(SLOTS.board);
+    let mut lights = unsafe { lighting_hw::Lights::new(&board::Clock(frequency), gpio) };
     let mut lighting = Lighting::default();
     loop {
         let mut response = [0; STATE_BYTES];
-        // Pull from the keyboard: a lighting fault must not strand USB in Send.
+        // Pull uphill: a lighting fault must not strand USB in Send.
         let (code, length) =
             userlib::sys_send(SLOTS.keyboard, GET_STATE, &[], &mut response, &mut [])
                 .expect("keyboard task died");

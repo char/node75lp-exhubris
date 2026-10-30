@@ -1,5 +1,5 @@
-//! Open-drain I2C on PB20/PB21. No syscalls inside a transaction: GPIO
-//! read-modify-writes cannot race the other cooperative tasks.
+//! Open-drain I2C on PB20/PB21. The board task owns every GPIO writer;
+//! USB can preempt transactions without touching these registers.
 
 use core::{
     arch::asm,
@@ -16,15 +16,7 @@ const SCL: u32 = 1 << 21;
 // Shared across every clock edge, including STOP; not a per-bit timeout.
 const STRETCH_POLLS: u32 = 20_000;
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("touch controller NACK")]
-    Nack,
-    #[error("touch clock stretch budget exhausted")]
-    ClockTimeout,
-    #[error("touch SDA stuck low")]
-    BusBusy,
-}
+use crate::BoardError as Error;
 
 pub struct I2c {
     address: u8,

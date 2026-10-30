@@ -1,0 +1,42 @@
+interface node75-board
+
+enum BoardError {
+    on-task-death Died
+    case Died
+    case Nack
+    case ClockTimeout
+    case BusBusy
+    case TooLong
+    rust-derive Copy Clone Debug PartialEq Eq
+}
+
+method i2c_write {
+    operation 0
+    arg register u16
+    lease data u8 {
+        read
+    }
+    result "Result<(), BoardError>"
+}
+
+method i2c_read {
+    operation 1
+    arg register u16
+    lease data u8 {
+        write
+    }
+    result "Result<(), BoardError>"
+}
+
+method touch_ready {
+    operation 2
+    result "Result<bool, BoardError>"
+}
+
+method apply_writes {
+    operation 3
+    lease writes GpioWrite {
+        read
+    }
+    result "Result<(), BoardError>"
+}

@@ -12,6 +12,8 @@ mod lighting_bridge;
 
 mod media_bridge;
 
+mod matrix_bridge;
+
 mod replies;
 
 mod board {
@@ -23,6 +25,9 @@ mod board {
         }
     }
 }
+
+// Bit 0 is reserved for supervisor fault notifications.
+const POLL_TIMER: u32 = 1 << 1;
 
 #[unsafe(no_mangle)]
 static mut USB_LEDS: u8 = 0;
@@ -51,13 +56,16 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
     device.set_telemetry(telemetry);
     let mut debounce = Debouncer::default();
     let mut keymap = node75_keymap::Keymap::new();
-    let mut last_scan = clock.millis();
+    let mut matrix = matrix_bridge::MatrixBridge::new();
+    let mut pending_matrix = None;
     let mut keys = [0; 6];
     let mut observe = lighting_bridge::observer();
     let mut touching = false;
     loop {
         let mut now = clock.millis();
-        if let Some(event) = hardware.poll() {
+        // A continuously active host must not prevent other tasks from running.
+        for _ in 0..16 {
+            let Some(event) = hardware.poll() else { break };
             let action = match event {
                 usb_hw::Event::Reset => {
                     device.reset();
@@ -92,15 +100,26 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
             unsafe { write_volatile(addr_of_mut!(USB_LEDS), device.leds()) };
             hardware.finish_event();
         }
-        if now.wrapping_sub(last_scan) >= 1 {
-            let raw = unsafe { node75_matrix::sample() };
-            now = clock.millis();
-            keys = debounce.update(raw, now);
-            keymap.update(keys, now, |resolved| {
-                device.set_report(Report::new(resolved.modifiers, resolved.usages()));
-            });
-            last_scan = now;
-            media_bridge::receive(&mut device, &mut touching);
+        match pending_matrix.take().or_else(|| matrix.receive(now)) {
+            Some(matrix_bridge::Event::Sample(sample)) => {
+                keys = debounce.update(sample.keys, sample.now);
+            }
+            Some(matrix_bridge::Event::Lost) => {
+                keys = [0; 6];
+                debounce = Debouncer::default();
+                keymap = node75_keymap::Keymap::new();
+                device.set_report(Report::default());
+            }
+            None => {}
+        }
+        now = clock.millis();
+        keymap.update(keys, now, |resolved| {
+            device.set_report(Report::new(resolved.modifiers, resolved.usages()));
+        });
+        media_bridge::receive(&mut device, &mut touching);
+        if !matrix.available() {
+            device.cancel_consumer();
+            touching = false;
         }
         if let Some(report) = device.report_due(now)
             && hardware.transmit(1, device.report_packet(report).as_slice())
@@ -112,7 +131,6 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
         {
             device.consumer_queued(u16::from_le_bytes(report));
         }
-        // GPIO and USB register transactions are complete before IPC can yield.
         observe(node75_lighting_api::State {
             keys,
             now,
@@ -120,5 +138,10 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
             leds: device.leds(),
             touching,
         });
+        // Leave CPU time for optional drivers, even if they stop making syscalls.
+        let time = userlib::sys_get_timer().now;
+        userlib::sys_set_timer(Some(time + 1), POLL_TIMER);
+        // Accept samples immediately so the board server can keep serving I2C/GPIO.
+        pending_matrix = matrix.wait(POLL_TIMER);
     }
 }

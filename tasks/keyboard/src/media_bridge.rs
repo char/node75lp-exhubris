@@ -5,7 +5,8 @@ use node75_usb::Device;
 use userlib::{ReplyFaultReason, ResponseCode};
 
 pub fn receive(device: &mut Device, touching: &mut bool) {
-    // Only this receiver can unblock the sender. Never wait for the sensor.
+    // Keyboard outranks the sender, so it cannot change state between this
+    // check and receive. Never wait for the sensor.
     let status = kipc::read_task_status(usize::from(SLOTS.touch.task_index()));
     if matches!(
         status,

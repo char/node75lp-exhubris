@@ -30,7 +30,7 @@ unsafe fn protected_write(address: usize, value: u8) {
 /// Requires exclusive peripheral access with interrupts disabled.
 pub unsafe fn initialize() -> Option<Clock> {
     unsafe {
-        // No inherited watchdog policy in this polled application.
+        // No inherited watchdog policy; task preemption is provided by SysTick.
         protected_write(0x4000_1046, 0x10);
         let config = read_volatile(0x4000_1008 as *const u16);
         let divisor = u32::from(config & 0x1f);
@@ -75,7 +75,8 @@ pub unsafe fn initialize() -> Option<Clock> {
         let alternate = 0x4000_1018 as *mut u16;
         write_volatile(alternate, read_volatile(alternate) & !0x8000);
         let analog = 0x4000_101a as *mut u16;
-        write_volatile(analog, read_volatile(analog) & !0xd003);
+        // Configure the USB pad before GPIO ownership passes to the board task.
+        write_volatile(analog, (read_volatile(analog) & !0xd043) | 0x80);
 
         // PB10/PB11 are USB D-/D+, not matrix pins; remove inherited GPIO pulls/drivers.
         for address in [0x4000_10c0usize, 0x4000_10d0, 0x4000_10d4] {

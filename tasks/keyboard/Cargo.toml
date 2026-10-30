@@ -11,7 +11,6 @@ hubris-abi = { package = "abi", path = "../../vendor/hubris/sys/abi" }
 hubris-task-slots = { path = "../../vendor/exhubris/sys/task-slots" }
 node75-keymap = { path = "../../lib/keymap" }
 node75-keyboard-core = { path = "../../lib/keyboard-core" }
-node75-matrix = { path = "../../lib/matrix" }
 node75-usb = { path = "../../lib/usb" }
 userlib = { path = "../../vendor/exhubris/sys/userlib", features = ["no-panic-messages"] }
 

@@ -6,7 +6,6 @@ use core::{
 use crate::board::Clock;
 
 const USB: usize = 0x4000_8000;
-const PIN_ANALOG_IE: *mut u16 = 0x4000_101a as *mut u16;
 const USB_CTRL: *mut u8 = USB as *mut u8;
 const UDEV_CTRL: *mut u8 = (USB + 1) as *mut u8;
 const USB_INT_EN: *mut u8 = (USB + 2) as *mut u8;
@@ -106,13 +105,11 @@ pub struct Usb {
 }
 
 impl Usb {
-    /// Call once, after the guard, with exclusive USB access and interrupts disabled.
+    /// Call once, after the guard, with exclusive USB and USB-pin ownership.
     pub unsafe fn new(clock: &Clock) -> Self {
         unsafe {
             // Disconnect first so a warm loader-to-application handoff is observable.
             write_volatile(USB_CTRL, 0);
-            let analog = read_volatile(PIN_ANALOG_IE);
-            write_volatile(PIN_ANALOG_IE, (analog | 0x80) & !0x40);
             write_volatile(UDEV_CTRL, 0);
             write_volatile(USB_INT_EN, 0);
             write_volatile(UEP4_1_MOD, 0);

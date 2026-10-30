@@ -108,16 +108,16 @@ index cfb1db78cc6f5827c757834d99e6b12505afdb12..5e5e0c4c0117608c19587e24acec9021
      }
 diff --git a/sys/kern/src/arch/ch582.rs b/sys/kern/src/arch/ch582.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..7edc159e03a4362e817ce2682ff024f2d637dc0f
+index 0000000000000000000000000000000000000000..ba24af8a82253d96256fb1c264e116abed69d6a1
 --- /dev/null
 +++ b/sys/kern/src/arch/ch582.rs
-@@ -0,0 +1,333 @@
+@@ -0,0 +1,379 @@
 +// This Source Code Form is subject to the terms of the Mozilla Public
 +// License, v. 2.0. If a copy of the MPL was not distributed with this
 +// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 +
-+//! CH582 QingKe V4A bootstrap: cooperative scheduling, no external interrupts.
-+//! Timers are polled at kernel entry; a task that never traps cannot be preempted.
++//! CH582 QingKe V4A: SysTick preemption and software trap frames.
++//! External device interrupts are not routed to tasks yet.
 +
 +use crate::{
 +    atomic::AtomicExt,
@@ -129,7 +129,7 @@ index 0000000000000000000000000000000000000000..7edc159e03a4362e817ce2682ff024f2
 +use abi::{FaultInfo, FaultSource, InterruptNum, IrqStatus, UsageError};
 +use core::{
 +    arch::{asm, global_asm},
-+    ptr::read_volatile,
++    ptr::{read_volatile, write_volatile},
 +    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
 +};
 +
@@ -210,6 +210,11 @@ index 0000000000000000000000000000000000000000..7edc159e03a4362e817ce2682ff024f2
 +    AtomicPtr::new(core::ptr::null_mut());
 +static CYCLES_PER_TICK: AtomicU32 = AtomicU32::new(0);
 +
++const SYSTICK: usize = 0xe000_f000;
++const PFIC: usize = 0xe000_e000;
++const SYSTICK_IRQ: u32 = 1 << 12;
++const SYSTICK_CAUSE: u32 = 0x8000_000c;
++
 +pub(crate) unsafe fn set_clock_freq(divisor: u32) {
 +    // Do not let inherited MPRV apply user mappings to kernel data accesses.
 +    unsafe {
@@ -219,17 +224,43 @@ index 0000000000000000000000000000000000000000..7edc159e03a4362e817ce2682ff024f2
 +    CYCLES_PER_TICK.store(divisor, Ordering::Relaxed);
 +}
 +
-+pub fn now() -> Timestamp {
-+    let cycles = unsafe {
++fn cycles() -> u64 {
++    unsafe {
 +        loop {
-+            let high = read_volatile(0xe000_f00c as *const u32);
-+            let low = read_volatile(0xe000_f008 as *const u32);
-+            if read_volatile(0xe000_f00c as *const u32) == high {
-+                break (u64::from(high) << 32) | u64::from(low);
++            let high = read_volatile((SYSTICK + 12) as *const u32);
++            let low = read_volatile((SYSTICK + 8) as *const u32);
++            if read_volatile((SYSTICK + 12) as *const u32) == high {
++                return (u64::from(high) << 32) | u64::from(low);
 +            }
 +        }
-+    };
-+    Timestamp::from(cycles / u64::from(CYCLES_PER_TICK.load(Ordering::Relaxed)))
++    }
++}
++
++pub fn now() -> Timestamp {
++    Timestamp::from(
++        cycles() / u64::from(CYCLES_PER_TICK.load(Ordering::Relaxed)),
++    )
++}
++
++fn arm_tick() {
++    let divisor = u64::from(CYCLES_PER_TICK.load(Ordering::Relaxed));
++    unsafe {
++        // Keep the monotonic counter running; anchor interrupts to millisecond boundaries.
++        write_volatile((SYSTICK + 4) as *mut u32, 0);
++        write_volatile((PFIC + 0x280) as *mut u32, SYSTICK_IRQ);
++        loop {
++            let deadline = (cycles() / divisor + 1) * divisor;
++            write_volatile((SYSTICK + 20) as *mut u32, u32::MAX);
++            write_volatile((SYSTICK + 16) as *mut u32, deadline as u32);
++            write_volatile((SYSTICK + 20) as *mut u32, (deadline >> 32) as u32);
++            if cycles() < deadline {
++                break;
++            }
++            // A comparison reached during the split write must not lose the next tick.
++            write_volatile((SYSTICK + 4) as *mut u32, 0);
++            write_volatile((PFIC + 0x280) as *mut u32, SYSTICK_IRQ);
++        }
++    }
 +}
 +
 +pub fn reinitialize(task: &mut Task) {
@@ -351,6 +382,19 @@ index 0000000000000000000000000000000000000000..7edc159e03a4362e817ce2682ff024f2
 +            options(nostack),
 +        );
 +        assert_eq!(actual, entry, "direct trap vector readback");
++        // The loader may have left device IRQs, fast vectors, or a threshold enabled.
++        write_volatile((PFIC + 0x180) as *mut u32, u32::MAX);
++        write_volatile((PFIC + 0x184) as *mut u32, u32::MAX);
++        write_volatile((PFIC + 0x280) as *mut u32, u32::MAX);
++        write_volatile((PFIC + 0x284) as *mut u32, u32::MAX);
++        for offset in [0x60, 0x64, 0x68, 0x6c] {
++            write_volatile((PFIC + offset) as *mut u32, 0);
++        }
++        write_volatile((PFIC + 0x40) as *mut u32, 0);
++        write_volatile((PFIC + 0x40c) as *mut u8, 0);
++        arm_tick();
++        write_volatile(SYSTICK as *mut u32, 0x07); // HCLK, no reload, IRQ enabled.
++        write_volatile((PFIC + 0x100) as *mut u32, SYSTICK_IRQ);
 +        set_current_task(task);
 +        ch582_restore(CURRENT_TASK_PTR.load(Ordering::Relaxed).cast())
 +    }
@@ -367,14 +411,18 @@ index 0000000000000000000000000000000000000000..7edc159e03a4362e817ce2682ff024f2
 +    let (index, number) = {
 +        let task = unsafe { &mut *current };
 +        assert_eq!(task.save().status & 0x1800, 0, "machine-mode trap");
-+        assert_eq!(cause & 0x80000000, 0, "unexpected CH582 interrupt");
 +        task.update_stack_watermark();
 +        (
 +            usize::from(task.descriptor().index),
 +            task.save().syscall_descriptor(),
 +        )
 +    };
-+    if cause == 8 {
++    if cause == SYSTICK_CAUSE {
++        arm_tick();
++        with_task_table(|tasks| {
++            let _ = task::process_timers(tasks, now());
++        });
++    } else if cause == 8 {
 +        let saved = unsafe { &mut *current }.save_mut();
 +        saved.pc = saved.pc.checked_add(4).expect("ECALL PC overflow");
 +        with_task_table(|tasks| {
@@ -383,23 +431,8 @@ index 0000000000000000000000000000000000000000..7edc159e03a4362e817ce2682ff024f2
 +        unsafe {
 +            crate::syscalls::syscall_entry(number, current);
 +        }
-+        // Honor the dispatcher's choice among peers, but not over a higher-priority timer wakeup.
-+        let previous = unsafe { &*CURRENT_TASK_PTR.load(Ordering::Relaxed) }
-+            .descriptor()
-+            .index;
-+        with_task_table(|tasks| {
-+            let next = task::select(usize::from(previous), tasks);
-+            if next
-+                .priority()
-+                .is_more_important_than(tasks[usize::from(previous)].priority())
-+            {
-+                apply_memory_protection(next);
-+                unsafe {
-+                    set_current_task(next);
-+                }
-+            }
-+        });
 +    } else {
++        assert_eq!(cause & 0x80000000, 0, "unexpected CH582 interrupt");
 +        let fault = match cause {
 +            0 | 1 | 4 | 5 | 6 | 7 => FaultInfo::MemoryAccess {
 +                address: Some(value),
@@ -409,20 +442,33 @@ index 0000000000000000000000000000000000000000..7edc159e03a4362e817ce2682ff024f2
 +            _ => FaultInfo::InvalidOperation(cause),
 +        };
 +        with_task_table(|tasks| {
-+            let next = match task::force_fault(tasks, index, fault) {
-+                task::NextTask::Specific(i) => &tasks[i],
-+                task::NextTask::Other => task::select(index, tasks),
-+                task::NextTask::Same => {
-+                    panic!("faulted task selected for return")
-+                }
-+            };
-+            assert!(!core::ptr::eq(next, current));
++            let _ = task::force_fault(tasks, index, fault);
++            let next = task::select(index, tasks);
++            assert_ne!(usize::from(next.descriptor().index), index);
 +            apply_memory_protection(next);
 +            unsafe {
 +                set_current_task(next);
 +            }
 +        });
 +    }
++    // Honor syscall handoffs between peers, but never over a higher-priority wakeup.
++    let previous = usize::from(
++        unsafe { &*CURRENT_TASK_PTR.load(Ordering::Relaxed) }
++            .descriptor()
++            .index,
++    );
++    with_task_table(|tasks| {
++        let next = task::select(previous, tasks);
++        if next
++            .priority()
++            .is_more_important_than(tasks[previous].priority())
++        {
++            apply_memory_protection(next);
++            unsafe {
++                set_current_task(next);
++            }
++        }
++    });
 +    CURRENT_TASK_PTR.load(Ordering::Relaxed)
 +}
 +
@@ -551,10 +597,10 @@ index 0000000000000000000000000000000000000000..c6e15a639dff5e161f2265b53bbb0c46
 +}
 diff --git a/sys/kern/src/arch/ch582/trap.S b/sys/kern/src/arch/ch582/trap.S
 new file mode 100644
-index 0000000000000000000000000000000000000000..3e5d2c6b537dd521c83f91c2ed1ba456ca176dc0
+index 0000000000000000000000000000000000000000..5b07c7dc966e2731c2d1f6aaec102f03be094843
 --- /dev/null
 +++ b/sys/kern/src/arch/ch582/trap.S
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,127 @@
 +// This Source Code Form is subject to the terms of the Mozilla Public
 +// License, v. 2.0. If a copy of the MPL was not distributed with this
 +// file, You can obtain one at https://mozilla.org/MPL/2.0/.
@@ -619,8 +665,9 @@ index 0000000000000000000000000000000000000000..3e5d2c6b537dd521c83f91c2ed1ba456
 +    mv t0, a0
 +    lw t1, 128(t0)
 +    csrw mepc, t1
-+    /* U-mode, MPRV off, interrupts off: this backend is cooperative. */
-+    csrw mstatus, zero
++    /* U-mode and MPRV off. MIE stays clear until mret restores it from MPIE. */
++    li t1, 0x80
++    csrw mstatus, t1
 +    csrw mscratch, t0
 +    lw x1, 4(t0)
 +    lw x2, 8(t0)

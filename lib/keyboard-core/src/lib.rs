@@ -10,6 +10,35 @@ pub const COLS: usize = 16;
 /// One bit per column, per row: bit `c` of `matrix[r]` is position (r, c).
 pub type Matrix = [u16; ROWS];
 
+pub const MATRIX_SAMPLE: u16 = 1;
+pub const MATRIX_SAMPLE_BYTES: usize = 4 + 2 * ROWS;
+
+pub struct MatrixSample {
+    pub keys: Matrix,
+    pub now: u32,
+}
+
+impl MatrixSample {
+    pub fn encode(&self) -> [u8; MATRIX_SAMPLE_BYTES] {
+        let mut bytes = [0; MATRIX_SAMPLE_BYTES];
+        bytes[..4].copy_from_slice(&self.now.to_le_bytes());
+        for (key, bytes) in self.keys.iter().zip(bytes[4..].chunks_exact_mut(2)) {
+            bytes.copy_from_slice(&key.to_le_bytes());
+        }
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; MATRIX_SAMPLE_BYTES] = bytes.try_into().ok()?;
+        let now = u32::from_le_bytes(bytes[..4].try_into().ok()?);
+        let mut keys = [0; ROWS];
+        for (key, bytes) in keys.iter_mut().zip(bytes[4..].chunks_exact(2)) {
+            *key = u16::from_le_bytes([bytes[0], bytes[1]]);
+        }
+        Some(Self { keys, now })
+    }
+}
+
 #[derive(Default)]
 pub struct Debouncer {
     stable: Matrix,
@@ -38,6 +67,23 @@ impl Debouncer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matrix_sample_preserves_sample_time_and_every_row() {
+        let sample = MatrixSample {
+            now: 0x12345678,
+            keys: [1, 0x8000, 0xffff, 2, 0, 0x100],
+        };
+        let bytes = [
+            0x78, 0x56, 0x34, 0x12, 1, 0, 0, 0x80, 0xff, 0xff, 2, 0, 0, 0, 0, 1,
+        ];
+        assert_eq!(sample.encode(), bytes);
+        let decoded = MatrixSample::decode(&bytes).unwrap();
+        assert_eq!(decoded.keys, sample.keys);
+        assert_eq!(decoded.now, sample.now);
+        assert!(MatrixSample::decode(&bytes[..15]).is_none());
+        assert!(MatrixSample::decode(&[0; 17]).is_none());
+    }
 
     #[test]
     fn bounce_is_filtered_per_key_on_both_edges() {

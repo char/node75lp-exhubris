@@ -69,7 +69,7 @@ reset:
 6:
     li t0, 0x1f
     csrw 0xbc0, t0
-    /* No fast-interrupt ABI or interrupt-driven drivers yet. */
+    /* Software trap frames require hardware stacking and nesting disabled. */
     csrw 0x804, zero
     la t0, _vectors_start
     ori t0, t0, 3

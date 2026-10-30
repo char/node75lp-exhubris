@@ -1,5 +1,5 @@
 //! CH582 GPIO matrix scan for the Node75 LP (6 drive rows × 16 sense
-//! columns). Used by the pre-kernel boot guard and the keyboard task.
+//! columns). Used by the pre-kernel boot guard and the board-I/O task.
 //! Pin assignments recovered from the stock firmware.
 
 #![no_std]
@@ -43,7 +43,7 @@ const CLEAR: usize = 12;
 const PULL_UP: usize = 16;
 const PULL_DOWN_DRIVE: usize = 20;
 
-/// Requires exclusive access to the GPIO registers, with interrupts disabled.
+/// Requires exclusive GPIO-register ownership, or pre-kernel execution with interrupts disabled.
 pub unsafe fn sample() -> [u16; 6] {
     unsafe {
         for (port, mask) in [(PA, 0xf20f), (PB, 0x000f_037f)] {

@@ -1,0 +1,16 @@
+[package]
+name = "node75-board-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hubpack = "0.1.2"
+serde = { version = "1", default-features = false, features = ["derive"] }
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[target.'cfg(target_os = "none")'.dependencies]
+idyll_runtime = { path = "../../vendor/exhubris/sys/idyll_runtime" }
+userlib = { path = "../../vendor/exhubris/sys/userlib" }
+
+[build-dependencies]
+hubris-build = { path = "../../vendor/exhubris/tools/build" }

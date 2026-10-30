@@ -3,12 +3,12 @@ use core::{
     ptr::{addr_of_mut, read_volatile, write_volatile},
 };
 
+use node75_board_api::{GpioWrite, Node75Board, Register};
 use node75_lighting_effects::{FRAME_BYTES, LEDS, Rgb, encode};
 
 use crate::board::Clock;
 
 const SPI: usize = 0x4000_4000;
-const PB: usize = 0x4000_10c0;
 const DATA_PIN: u32 = 1 << 14;
 const POWER_PIN: u32 = 1 << 15;
 const FRAME_MS: u32 = 8;
@@ -28,15 +28,17 @@ enum State {
 }
 
 pub struct Lights {
+    gpio: Node75Board,
     state: State,
     supported_clock: bool,
     shown: [Rgb; LEDS],
 }
 
 impl Lights {
-    /// Requires exclusive SPI0, PB14/PB15, and DMA-buffer ownership.
-    pub unsafe fn new(clock: &Clock) -> Self {
+    /// Requires exclusive SPI0 and DMA-buffer ownership.
+    pub unsafe fn new(clock: &Clock, gpio: Node75Board) -> Self {
         let mut lights = Self {
+            gpio,
             state: State::Off,
             // Stock's divisor and pulse encoding are characterized only at 60 MHz.
             supported_clock: clock.frequency_hz() == 60_000_000,
@@ -61,19 +63,20 @@ impl Lights {
             let force = match self.state {
                 State::Off => {
                     // Stock enables lighting by driving PB15 low; off releases it.
-                    write_volatile((PB + 12) as *mut u32, POWER_PIN | DATA_PIN);
-                    let drive = (PB + 20) as *mut u32;
-                    write_volatile(drive, read_volatile(drive) & !(POWER_PIN | DATA_PIN));
-                    write_volatile(
-                        PB as *mut u32,
-                        read_volatile(PB as *const u32) | POWER_PIN | DATA_PIN,
-                    );
-                    self.state = State::Powering(now);
+                    self.gpio
+                        .apply_writes(&[
+                            GpioWrite::new(Register::ClearB, 0, POWER_PIN | DATA_PIN),
+                            GpioWrite::new(Register::PullDownB, POWER_PIN | DATA_PIN, 0),
+                            GpioWrite::new(Register::DirectionB, 0, POWER_PIN | DATA_PIN),
+                        ])
+                        .expect("lighting GPIO");
+                    self.state = State::Powering(userlib::sys_get_timer().now as u32);
                     return;
                 }
                 State::Powering(since) if now.wrapping_sub(since) >= 2 => {
-                    let alternate = 0x4000_1018 as *mut u16;
-                    write_volatile(alternate, read_volatile(alternate) | 0x100);
+                    self.gpio
+                        .apply_writes(&[GpioWrite::new(Register::PinAlternate, 0, 0x100)])
+                        .expect("lighting pin mux");
                     write_volatile((SPI + 3) as *mut u8, 7);
                     write_volatile(SPI as *mut u8, 2);
                     write_volatile(SPI as *mut u8, 0x40);
@@ -118,11 +121,14 @@ impl Lights {
             write_volatile((SPI + 2) as *mut u8, 0);
             write_volatile(SPI as *mut u8, 2);
             write_volatile(SPI as *mut u8, 0);
-            write_volatile((PB + 12) as *mut u32, DATA_PIN);
-            for address in [PB + 16, PB + 20, PB] {
-                let register = address as *mut u32;
-                write_volatile(register, read_volatile(register) & !POWER_PIN);
-            }
+            self.gpio
+                .apply_writes(&[
+                    GpioWrite::new(Register::ClearB, 0, DATA_PIN),
+                    GpioWrite::new(Register::PullUpB, POWER_PIN, 0),
+                    GpioWrite::new(Register::PullDownB, POWER_PIN, 0),
+                    GpioWrite::new(Register::DirectionB, POWER_PIN, 0),
+                ])
+                .expect("lighting power off");
         }
     }
 }

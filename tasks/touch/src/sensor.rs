@@ -1,15 +1,9 @@
 //! IQS7222C configuration recovered from stock firmware 1.0.10.6.
 //! PB20/PB21 carry I2C; PA7 is the active-low ready signal.
 
-use core::ptr::{read_volatile, write_volatile};
-
-use crate::i2c::I2c;
-
-const ADDRESS: u8 = 0x44;
+use hubris_task_slots::SLOTS;
+use node75_board_api::Node75Board;
 const PRODUCT: u16 = 863;
-const PA: usize = 0x4000_10a0;
-const PIN_ANALOG_IE: *mut u16 = 0x4000_101a as *mut u16;
-const RDY: u32 = 1 << 7;
 const STATUS_ATI_ACTIVE: u8 = 1 << 0;
 const STATUS_ATI_ERROR: u8 = 1 << 1;
 const STATUS_RESET: u8 = 1 << 3;
@@ -21,24 +15,14 @@ pub enum Service {
 }
 
 pub struct Sensor {
-    i2c: I2c,
+    board: Node75Board,
     configuration: Option<usize>,
 }
 
 impl Sensor {
-    /// Requires exclusive access to PB20/PB21 and PA7.
-    pub unsafe fn new() -> Self {
-        unsafe {
-            write_volatile(PIN_ANALOG_IE, read_volatile(PIN_ANALOG_IE) & !0x0008);
-            let dir = PA as *mut u32;
-            write_volatile(dir, read_volatile(dir) & !RDY);
-            let pull_down = (PA + 20) as *mut u32;
-            write_volatile(pull_down, read_volatile(pull_down) & !RDY);
-            let pull_up = (PA + 16) as *mut u32;
-            write_volatile(pull_up, read_volatile(pull_up) | RDY);
-        }
+    pub fn new() -> Self {
         Self {
-            i2c: unsafe { I2c::new(ADDRESS) },
+            board: Node75Board::from(SLOTS.board),
             configuration: Some(0),
         }
     }
@@ -51,36 +35,39 @@ impl Sensor {
         }
     }
 
-    fn ready(&self) -> bool {
-        unsafe { read_volatile((PA + 4) as *const u32) & RDY == 0 }
-    }
-
     pub fn force_window(&mut self) {
-        if !self.ready() {
-            let _ = self.i2c.write(0xff, &[]);
+        if matches!(self.board.touch_ready(), Ok(false)) {
+            let _ = self.board.i2c_write(0xff, &[]);
         }
     }
 
     pub fn service(&mut self) -> Service {
-        if !self.ready() {
-            if self.configuration.is_some() {
-                self.configuration = Some(0);
+        match self.board.touch_ready() {
+            Ok(true) => {}
+            Ok(false) => {
+                if self.configuration.is_some() {
+                    self.configuration = Some(0);
+                }
+                return Service::Idle;
             }
-            return Service::Idle;
+            Err(_) => {
+                self.configuration = Some(0);
+                return Service::Invalid;
+            }
         }
         if let Some(index) = self.configuration {
-            // Yield between configuration blocks so USB keeps running.
+            // Bound each configuration step so other board-I/O clients can run.
             let (register, data) = CONFIG[index];
             let failed = (index == 1 && !self.identify())
-                || self.i2c.write(register, data).is_err()
+                || self.board.i2c_write(register, data).is_err()
                 // Retained stock state may have a 100 ms window. Allow time
-                // for cooperative yields; CONFIG restores 100 ms at the end.
-                || (index == 0 && self.i2c.write(0xdc, &500u16.to_le_bytes()).is_err());
+                // for IPC and preemption; CONFIG restores 100 ms at the end.
+                || (index == 0 && self.board.i2c_write(0xdc, &500u16.to_le_bytes()).is_err());
             if failed {
                 self.configuration = Some(0);
-                let _ = self.i2c.write(0xff, &[]);
+                let _ = self.board.i2c_write(0xff, &[]);
             } else if index + 1 == CONFIG.len() {
-                self.configuration = if self.i2c.write(0xff, &[]).is_ok() {
+                self.configuration = if self.board.i2c_write(0xff, &[]).is_ok() {
                     None
                 } else {
                     Some(0)
@@ -91,7 +78,7 @@ impl Sensor {
             return Service::Invalid;
         }
         let result = self.read_position();
-        if self.i2c.write(0xff, &[]).is_err() {
+        if self.board.i2c_write(0xff, &[]).is_err() {
             return Service::Invalid;
         }
         result
@@ -99,17 +86,17 @@ impl Sensor {
 
     fn identify(&mut self) -> bool {
         let mut product = [0; 2];
-        self.i2c.read(0x00, &mut product).is_ok() && u16::from_le_bytes(product) == PRODUCT
+        self.board.i2c_read(0x00, &mut product).is_ok() && u16::from_le_bytes(product) == PRODUCT
     }
 
     fn read_position(&mut self) -> Service {
         // A sensor reset restores STOP-terminated windows. Keep this window
         // open before reading identity and status in separate transactions.
-        if self.i2c.write(0xda, &[0x0d]).is_err() || !self.identify() {
+        if self.board.i2c_write(0xda, &[0x0d]).is_err() || !self.identify() {
             return Service::Invalid;
         }
         let mut block = [0; 10];
-        if self.i2c.read(0x10, &mut block).is_err() {
+        if self.board.i2c_read(0x10, &mut block).is_err() {
             return Service::Invalid;
         }
         let status = block[0];
@@ -121,7 +108,7 @@ impl Sensor {
             return Service::Invalid;
         }
         if status & STATUS_ATI_ERROR != 0 {
-            let _ = self.i2c.write(0xd0, &[0xb5, 0x00]);
+            let _ = self.board.i2c_write(0xd0, &[0xb5, 0x00]);
             return Service::Invalid;
         }
         match u16::from_le_bytes([block[8], block[9]]) {
