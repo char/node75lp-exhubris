@@ -1,0 +1,114 @@
+keep task allocations inside declared memory regions
+
+The allocator could place a final chunk past the end of its range, and region
+ends were rounded up into a partial granule. Peripheral bounds were truncated
+to 32 bits with `as`.
+
+diff --git a/tools/alloc/src/lib.rs b/tools/alloc/src/lib.rs
+index d4faf9d044b6c14eb84ce7f99a402ffe7db8cc20..56f8565bbd0a786f0935b292ffe23b9edf90a5b1 100644
+--- a/tools/alloc/src/lib.rs
++++ b/tools/alloc/src/lib.rs
+@@ -132,9 +132,7 @@ pub fn allocate(
+                     .map(|(pad, order, left)| (task, mem, pad, mem_sizes[mem].checked_div(pad).unwrap_or(u64::MAX), order, left))
+             })
+             .max_by_key(|(_task, _mem, _pad, cost, ..)| *cost);
+-        let Some((c_task, c_mem, c_pad, _cost, c_order, c_left)) = candidate else {
+-            panic!("cannot place a task here even with padding");
+-        };
++        let (c_task, c_mem, c_pad, _cost, c_order, c_left) = candidate?;
+ 
+         *result.waste.entry(c_mem.clone()).or_default() += c_pad;
+         let ta = result.tasks.entry(c_task.clone()).or_default();
+@@ -190,6 +188,9 @@ fn place_task(
+                 avail.start += pad_unit;
+                 continue 'alignloop;
+             };
++            if avail.start + (1 << next_digit) > avail.end {
++                return None;
++            }
+             digits_left[next_digit] -= 1;
+             avail.start += 1 << next_digit;
+             used_order.push(next_digit);
+@@ -292,6 +293,22 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn allocations_never_extend_past_available_memory() {
++        let ram = Mem("ram".to_string());
++        let tasks = [(TaskName("big".to_string()), TaskInfo {
++            regs_avail: 1,
++            reqs: [(ram.clone(), 8)].into_iter().collect(),
++        })].into_iter().collect::<BTreeMap<_, _>>();
++
++        let exact = [(ram.clone(), 0..8)].into_iter().collect();
++        let (_, left) = allocate(&tasks, &exact).expect("exact fit");
++        assert_eq!(left[&ram], 8..8);
++
++        let short = [(ram.clone(), 0..4)].into_iter().collect();
++        assert!(allocate(&tasks, &short).is_none());
++    }
++
+     #[test]
+     fn allocate_example_app() {
+         let flash = Mem("flash".to_string());
+diff --git a/tools/build/src/alloc.rs b/tools/build/src/alloc.rs
+index 78b71995d2433191eaf206e5fbfb354f127c7751..f7b54f83c3bc3b7b20660257351c416932a27baf 100644
+--- a/tools/build/src/alloc.rs
++++ b/tools/build/src/alloc.rs
+@@ -92,7 +92,7 @@ pub fn allocate_space(
+             let round = granule - 1;
+             available.values_mut().for_each(|range| {
+                 range.start = (range.start.next_multiple_of(granule) + round) / granule;
+-                range.end = (range.end + round) / granule;
++                range.end /= granule;
+             });
+             let tasks_granule = tasks.iter().map(|(name, info)| {
+                 (name.clone(), TaskInfo {
+@@ -124,7 +124,7 @@ pub fn allocate_space(
+             let round = granule - 1;
+             available.values_mut().for_each(|range| {
+                 range.start = (range.start + round) / granule;
+-                range.end = (range.end + round) / granule;
++                range.end /= granule;
+             });
+             for (name, info) in tasks {
+                 let ta = results.tasks.entry(name.0.clone()).or_default();
+@@ -135,6 +135,9 @@ pub fn allocate_space(
+                     let av = available.get_mut(mem).unwrap();
+                     let base = av.start * granule;
+                     av.start += granule_size;
++                    if av.start > av.end {
++                        bail!("can't fit app in memory");
++                    }
+ 
+                     ta.insert(mem.0.clone(), TaskAllocation {
+                         requested: *orig_byte_size,
+diff --git a/tools/build/src/kconfig.rs b/tools/build/src/kconfig.rs
+index 32e9603f8854bb599983f9b403aecb24bb8ef3ed..3b895a300a3012eb31ca060a848ac32bdaaa3f9f 100644
+--- a/tools/build/src/kconfig.rs
++++ b/tools/build/src/kconfig.rs
+@@ -20,18 +20,18 @@ pub fn generate_kconfig(
+         .map(|(name, pdef)| {
+             let pdef = pdef.value();
+ 
+-            (name.clone(), kconfig::RegionConfig {
+-                base: *pdef.base.value() as u32,
+-                size: *pdef.size.value() as u32,
++            Ok((name.clone(), kconfig::RegionConfig {
++                base: u32::try_from(*pdef.base.value()).into_diagnostic()?,
++                size: u32::try_from(*pdef.size.value()).into_diagnostic()?,
+                 attributes: kconfig::RegionAttributes {
+                     read: true,
+                     write: true,
+                     execute: false,
+                     special_role: Some(kconfig::SpecialRole::Device),
+                 },
+-            })
++            }))
+         })
+-    .collect();
++    .collect::<miette::Result<_>>()?;
+ 
+     let mut kconfig = kconfig::KernelConfig {
+         tasks: vec![],
