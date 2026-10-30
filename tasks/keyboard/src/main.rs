@@ -7,7 +7,7 @@ use core::mem::MaybeUninit;
 
 use hubris_task_slots::SLOTS;
 use idyll_runtime::Meta;
-use node75_keyboard_core::{Debouncer, Matrix};
+use node75_keyboard_core::Matrix;
 use node75_keymap::Keymap;
 use node75_usb::{Action, Device, Report};
 use userlib::{ReplyFaultReason, TaskId};
@@ -29,6 +29,7 @@ mod board {
 const FAULT: u32 = 1 << 0;
 const POLL_TIMER: u32 = 1 << 1;
 // A board task that stops scanning without faulting must not leave keys held.
+// Board repeats the matrix at least every 100 ms.
 const STALE_MS: u32 = 250;
 
 #[unsafe(no_mangle)]
@@ -56,7 +57,6 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
     let mut hardware = unsafe { usb_hw::Usb::new(&clock) };
     let mut keyboard = Keyboard {
         device: Device::default(),
-        debounce: Debouncer::default(),
         keymap: Keymap::new(),
         keys: [0; 6],
         sampled_at: None,
@@ -104,6 +104,10 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
             unsafe { write_volatile(addr_of_mut!(USB_LEDS), device.leds()) };
             hardware.finish_event();
         }
+        // Every pass, not just on matrix changes: tap-hold resolves with time.
+        keyboard.keymap.update(keyboard.keys, now, |resolved| {
+            device.set_report(Report::new(resolved.modifiers, resolved.usages()));
+        });
         if let Some(report) = device.report_due(now)
             && hardware.transmit(1, device.report_packet(report).as_slice())
         {
@@ -127,7 +131,6 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
 
 struct Keyboard {
     device: Device,
-    debounce: Debouncer,
     keymap: Keymap,
     keys: Matrix,
     sampled_at: Option<u32>,
@@ -136,7 +139,6 @@ struct Keyboard {
 
 impl Keyboard {
     fn release_inputs(&mut self) {
-        self.debounce = Debouncer::default();
         self.keymap = Keymap::new();
         self.keys = [0; 6];
         self.sampled_at = None;
@@ -174,19 +176,10 @@ fn expect(meta: &Meta, client: TaskId) -> Result<(), ReplyFaultReason> {
 }
 
 impl Node75Keyboard for Keyboard {
-    fn matrix_sample(
-        &mut self,
-        meta: Meta,
-        keys: [u16; 6],
-        now: u32,
-    ) -> Result<(), ReplyFaultReason> {
+    fn set_matrix(&mut self, meta: Meta, keys: [u16; 6]) -> Result<(), ReplyFaultReason> {
         expect(&meta, SLOTS.board)?;
-        self.keys = self.debounce.update(keys, now);
-        self.sampled_at = Some(now);
-        let device = &mut self.device;
-        self.keymap.update(self.keys, now, |resolved| {
-            device.set_report(Report::new(resolved.modifiers, resolved.usages()));
-        });
+        self.keys = keys;
+        self.sampled_at = Some(userlib::sys_get_timer().now as u32);
         Ok(())
     }
 

@@ -173,6 +173,10 @@ impl Keymap {
     /// Feed one debounced scan. `emit` is called with the resolved keys
     /// whenever they change, in order (a tap emits its key down and up).
     pub fn update(&mut self, matrix: Matrix, now: u32, mut emit: impl FnMut(Resolved)) {
+        // Called on every USB poll, so the common case must stay cheap.
+        if matrix == self.previous && self.pending.is_none() {
+            return;
+        }
         let mut last = self.resolved();
         let mut emit = |resolved: Resolved| {
             if resolved != last {

@@ -8,12 +8,15 @@ use core::{
 use hubris_task_slots::SLOTS;
 use idyll_runtime::{Leased, Meta, Read, Write};
 use node75_ipc::{board::MAX_I2C_BYTES, keyboard::Node75Keyboard};
+use node75_keyboard_core::{Debouncer, Matrix};
 use userlib::{ReplyFaultReason, TaskId};
 
 mod i2c;
 include!(concat!(env!("OUT_DIR"), "/server.rs"));
 
 const TICK: u32 = 1;
+// Lets keyboard tell a hung scanner from an idle matrix; see its STALE_MS.
+const HEARTBEAT_MS: u32 = 100;
 const PA: usize = 0x4000_10a0;
 const PB: usize = 0x4000_10c0;
 const RDY: u32 = 1 << 7;
@@ -28,6 +31,8 @@ fn main() -> ! {
     let mut server = Server {
         i2c: unsafe { i2c::I2c::new(0x44) },
         keyboard: Node75Keyboard::from(SLOTS.keyboard),
+        debounce: Debouncer::default(),
+        sent: None,
     };
     unsafe {
         let analog = 0x4000_101a as *mut u16;
@@ -46,6 +51,8 @@ fn main() -> ! {
 struct Server {
     i2c: i2c::I2c,
     keyboard: Node75Keyboard,
+    debounce: Debouncer,
+    sent: Option<(Matrix, u32)>,
 }
 
 impl idyll_runtime::NotificationHandler for Server {
@@ -53,12 +60,21 @@ impl idyll_runtime::NotificationHandler for Server {
         if bits & TICK == 0 {
             return;
         }
-        let keys = unsafe { node75_matrix::sample() };
-        // USB outranks us and accepts samples without ever waiting on GPIO.
-        self.keyboard
-            .matrix_sample(keys, userlib::sys_get_timer().now as u32);
-        let now = userlib::sys_get_timer().now;
-        userlib::sys_set_timer(Some(now + 1), TICK);
+        let time = userlib::sys_get_timer().now;
+        let now = time as u32;
+        let keys = self
+            .debounce
+            .update(unsafe { node75_matrix::sample() }, now);
+        // IPC dominates this chip's CPU budget, so send only changes.
+        if self
+            .sent
+            .is_none_or(|(sent, at)| sent != keys || now.wrapping_sub(at) >= HEARTBEAT_MS)
+        {
+            // USB outranks us and accepts the matrix without ever waiting on GPIO.
+            self.keyboard.set_matrix(keys);
+            self.sent = Some((keys, now));
+        }
+        userlib::sys_set_timer(Some(time + 1), TICK);
     }
 }
 

@@ -8,11 +8,10 @@ struct LightingState {
     field touching bool
 }
 
-method matrix_sample {
-    doc "Board task: one raw matrix scan and when it was taken."
+method set_matrix {
+    doc "Board task: the debounced matrix, whenever it changes and at least every 100 ms."
     operation 0
     arg keys "[u16; 6]"
-    arg now u32
     auto-retry
 }
 

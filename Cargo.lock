@@ -1184,6 +1184,7 @@ dependencies = [
  "hubris-task-slots",
  "idyll_runtime",
  "node75-ipc",
+ "node75-keyboard-core",
  "node75-matrix",
  "serde",
  "userlib",
