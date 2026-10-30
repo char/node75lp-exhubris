@@ -1183,15 +1183,21 @@ dependencies = [
  "hubris-build",
  "hubris-task-slots",
  "idyll_runtime",
- "node75-board-api",
- "node75-keyboard-core",
+ "node75-ipc",
  "node75-matrix",
  "serde",
  "userlib",
 ]
 
 [[package]]
-name = "node75-board-api"
+name = "node75-idle"
+version = "0.1.0"
+dependencies = [
+ "userlib",
+]
+
+[[package]]
+name = "node75-ipc"
 version = "0.1.0"
 dependencies = [
  "hubpack",
@@ -1200,13 +1206,6 @@ dependencies = [
  "serde",
  "userlib",
  "zerocopy 0.8.63",
-]
-
-[[package]]
-name = "node75-idle"
-version = "0.1.0"
-dependencies = [
- "userlib",
 ]
 
 [[package]]
@@ -1221,14 +1220,15 @@ dependencies = [
 name = "node75-keyboard"
 version = "0.1.0"
 dependencies = [
- "abi",
+ "hubpack",
+ "hubris-build",
  "hubris-task-slots",
+ "idyll_runtime",
  "kipc",
  "node75-keyboard-core",
  "node75-keymap",
- "node75-lighting-api",
- "node75-touch-api",
  "node75-usb",
+ "serde",
  "userlib",
 ]
 
@@ -1248,15 +1248,10 @@ name = "node75-lighting"
 version = "0.1.0"
 dependencies = [
  "hubris-task-slots",
- "node75-board-api",
- "node75-lighting-api",
+ "node75-ipc",
  "node75-lighting-effects",
  "userlib",
 ]
-
-[[package]]
-name = "node75-lighting-api"
-version = "0.1.0"
 
 [[package]]
 name = "node75-lighting-effects"
@@ -1274,7 +1269,7 @@ name = "node75-touch"
 version = "0.1.0"
 dependencies = [
  "hubris-task-slots",
- "node75-board-api",
+ "node75-ipc",
  "node75-touch-api",
  "userlib",
 ]

@@ -1,0 +1,37 @@
+interface node75-keyboard
+
+struct LightingState {
+    field keys "[u16; 6]"
+    field now u32
+    field active bool
+    field leds u8
+    field touching bool
+}
+
+method matrix_sample {
+    doc "Board task: one raw matrix scan and when it was taken."
+    operation 0
+    arg keys "[u16; 6]"
+    arg now u32
+    auto-retry
+}
+
+method media_key {
+    doc "Touch task: the consumer usage now held, or 0. False if USB dropped it."
+    operation 1
+    arg usage u16
+    result bool
+    auto-retry
+}
+
+method set_contact {
+    operation 2
+    arg touching bool
+    auto-retry
+}
+
+method lighting_state {
+    operation 3
+    result LightingState
+    auto-retry
+}

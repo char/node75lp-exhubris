@@ -7,8 +7,7 @@ use core::{
 };
 use hubris_task_slots::SLOTS;
 use idyll_runtime::{Leased, Meta, Read, Write};
-use node75_board_api::MAX_I2C_BYTES;
-use node75_keyboard_core::{MATRIX_SAMPLE, MatrixSample};
+use node75_ipc::{board::MAX_I2C_BYTES, keyboard::Node75Keyboard};
 use userlib::{ReplyFaultReason, TaskId};
 
 mod i2c;
@@ -28,7 +27,7 @@ const LED_POWER: u32 = 1 << 15;
 fn main() -> ! {
     let mut server = Server {
         i2c: unsafe { i2c::I2c::new(0x44) },
-        keyboard: SLOTS.keyboard,
+        keyboard: Node75Keyboard::from(SLOTS.keyboard),
     };
     unsafe {
         let analog = 0x4000_101a as *mut u16;
@@ -46,7 +45,7 @@ fn main() -> ! {
 
 struct Server {
     i2c: i2c::I2c,
-    keyboard: TaskId,
+    keyboard: Node75Keyboard,
 }
 
 impl idyll_runtime::NotificationHandler for Server {
@@ -55,20 +54,9 @@ impl idyll_runtime::NotificationHandler for Server {
             return;
         }
         let keys = unsafe { node75_matrix::sample() };
-        let sample = MatrixSample {
-            keys,
-            now: userlib::sys_get_timer().now as u32,
-        };
-        // USB outranks us. It accepts pending samples without ever waiting on GPIO.
-        if let Err(dead) = userlib::sys_send(
-            self.keyboard,
-            MATRIX_SAMPLE,
-            &sample.encode(),
-            &mut [],
-            &mut [],
-        ) {
-            self.keyboard = self.keyboard.with_generation(dead.new_generation());
-        }
+        // USB outranks us and accepts samples without ever waiting on GPIO.
+        self.keyboard
+            .matrix_sample(keys, userlib::sys_get_timer().now as u32);
         let now = userlib::sys_get_timer().now;
         userlib::sys_set_timer(Some(now + 1), TICK);
     }

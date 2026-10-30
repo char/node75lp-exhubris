@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-node75-board-api = { path = "../../lib/board-api" }
-node75-keyboard-core = { path = "../../lib/keyboard-core" }
+node75-ipc = { path = "../../lib/ipc" }
 node75-matrix = { path = "../../lib/matrix" }
 hubris-task-slots = { path = "../../vendor/exhubris/sys/task-slots" }
 hubpack = "0.1.2"

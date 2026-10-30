@@ -2,7 +2,8 @@
 #![no_main]
 
 use hubris_task_slots::SLOTS;
-use node75_touch_api::{CONTACT, Gestures, MEDIA_KEY, MediaEvent, encode_contact};
+use node75_ipc::keyboard::Node75Keyboard;
+use node75_touch_api::{Gestures, MediaEvent};
 
 mod sensor;
 
@@ -14,6 +15,7 @@ const PROBE_MS: u32 = 500;
 
 #[unsafe(export_name = "main")]
 fn main() -> ! {
+    let keyboard = Node75Keyboard::from(SLOTS.keyboard);
     let mut sensor = Sensor::new();
     let mut gestures = Gestures::default();
     let mut last_sample = None;
@@ -28,14 +30,14 @@ fn main() -> ! {
         let now = userlib::sys_get_timer().now as u32;
         match sample {
             Service::Position(position) => {
-                report_contact(&mut touching, position.is_some());
+                report_contact(&keyboard, &mut touching, position.is_some());
                 last_sample = position.map(|_| now);
                 if position.is_none() {
                     inhibited = false;
                 }
                 if !inhibited {
                     let mut accepted = true;
-                    gestures.update(position, now, |event| accepted &= send(event));
+                    gestures.update(position, now, |event| accepted &= send(&keyboard, event));
                     if !accepted {
                         // USB canceled the queue. Do not replay gestures after
                         // reconnect or turn the remainder of this touch into a tap.
@@ -45,18 +47,18 @@ fn main() -> ! {
                 }
             }
             Service::Invalid => {
-                report_contact(&mut touching, false);
+                report_contact(&keyboard, &mut touching, false);
                 gestures.cancel(|event| {
-                    send(event);
+                    send(&keyboard, event);
                 });
                 inhibited = true;
                 last_sample = None;
             }
             Service::Idle => {
                 if last_sample.is_some_and(|at| now.wrapping_sub(at) >= STALE_MS) {
-                    report_contact(&mut touching, false);
+                    report_contact(&keyboard, &mut touching, false);
                     gestures.cancel(|event| {
-                        send(event);
+                        send(&keyboard, event);
                     });
                     inhibited = true;
                     last_sample = None;
@@ -71,33 +73,14 @@ fn main() -> ! {
 }
 
 /// Tell the keyboard when a finger lands on or leaves the bar, for lighting.
-fn report_contact(touching: &mut bool, contact: bool) {
-    if *touching == contact {
-        return;
+fn report_contact(keyboard: &Node75Keyboard, touching: &mut bool, contact: bool) {
+    if *touching != contact {
+        *touching = contact;
+        keyboard.set_contact(contact);
     }
-    *touching = contact;
-    // Cosmetic only: a keyboard that cannot take the update loses nothing.
-    let _ = userlib::sys_send(
-        SLOTS.keyboard,
-        CONTACT,
-        &encode_contact(contact),
-        &mut [],
-        &mut [],
-    );
 }
 
-fn send(event: MediaEvent) -> bool {
-    // The keyboard receives only from an already-blocked sender and replies
-    // immediately, without waiting for the USB host.
-    let mut reply = [0];
-    let Ok((code, length)) = userlib::sys_send(
-        SLOTS.keyboard,
-        MEDIA_KEY,
-        &event.encode(),
-        &mut reply,
-        &mut [],
-    ) else {
-        return false;
-    };
-    code == userlib::ResponseCode::SUCCESS && length == 1 && reply[0] == 1
+/// False if USB discarded the gesture queue.
+fn send(keyboard: &Node75Keyboard, event: MediaEvent) -> bool {
+    keyboard.media_key(if event.pressed { event.key.usage() } else { 0 })
 }

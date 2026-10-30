@@ -1,5 +1,5 @@
 fn main() {
-    let schema = "../../lib/board-api/board.kdl";
+    let schema = "../../lib/ipc/board.kdl";
     println!("cargo::rerun-if-changed={schema}");
     let interface = hubris_build::idl::load_interface(schema).expect("board interface");
     let server = hubris_build::idl::codegen::generate_server(&interface).expect("board server");

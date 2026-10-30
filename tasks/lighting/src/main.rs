@@ -4,10 +4,12 @@
 use core::ptr::read_volatile;
 
 use hubris_task_slots::SLOTS;
-use node75_lighting_api::{GET_STATE, STATE_BYTES, State};
+use node75_ipc::{board::Node75Board, keyboard::Node75Keyboard};
 use node75_lighting_effects::Lighting;
 
 mod lighting_hw;
+
+const FRAME_TICK: u32 = 1;
 
 mod board {
     pub struct Clock(pub u32);
@@ -29,18 +31,13 @@ fn main() -> ! {
         0x80 => 32_000_000,
         _ => panic!("unsupported inherited clock"),
     };
-    let gpio = node75_board_api::Node75Board::from(SLOTS.board);
+    let keyboard = Node75Keyboard::from(SLOTS.keyboard);
+    let gpio = Node75Board::from(SLOTS.board);
     let mut lights = unsafe { lighting_hw::Lights::new(&board::Clock(frequency), gpio) };
     let mut lighting = Lighting::default();
     loop {
-        let mut response = [0; STATE_BYTES];
         // Pull uphill: a lighting fault must not strand USB in Send.
-        let (code, length) =
-            userlib::sys_send(SLOTS.keyboard, GET_STATE, &[], &mut response, &mut [])
-                .expect("keyboard task died");
-        assert_eq!(code, userlib::ResponseCode::SUCCESS);
-        assert_eq!(length, STATE_BYTES);
-        let state = State::decode(&response).expect("invalid keyboard state");
+        let state = keyboard.lighting_state();
         if state.active {
             lighting.update(state.keys, state.now);
         } else {
@@ -49,5 +46,8 @@ fn main() -> ! {
         lights.poll(state.active, state.now, || {
             lighting.frame(state.now, state.leds & 2 != 0, state.touching)
         });
+        let now = userlib::sys_get_timer().now;
+        userlib::sys_set_timer(Some(now + 1), FRAME_TICK);
+        userlib::sys_recv_notification(FRAME_TICK);
     }
 }

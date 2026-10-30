@@ -5,25 +5,6 @@
 #[cfg(test)]
 extern crate std;
 
-/// IPC operation: touch task → keyboard task, payload [`MediaEvent`].
-pub const MEDIA_KEY: u16 = 1;
-
-/// IPC operation: touch task → keyboard task, sent whenever a finger lands on
-/// or leaves the bar. Payload [`encode_contact`].
-pub const CONTACT: u16 = 2;
-
-pub fn encode_contact(touching: bool) -> [u8; 1] {
-    [u8::from(touching)]
-}
-
-pub fn decode_contact(bytes: &[u8]) -> Option<bool> {
-    match bytes {
-        [0] => Some(false),
-        [1] => Some(true),
-        _ => None,
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Media {
     NextTrack,
@@ -44,42 +25,13 @@ impl Media {
             Media::VolumeDown => 0x00ea,
         }
     }
-
-    fn from_tag(tag: u8) -> Option<Self> {
-        Some(match tag {
-            0 => Media::NextTrack,
-            1 => Media::PrevTrack,
-            2 => Media::PlayPause,
-            3 => Media::VolumeUp,
-            4 => Media::VolumeDown,
-            _ => return None,
-        })
-    }
 }
 
-/// One key transition, as sent over IPC: `[tag, pressed]`.
+/// One key transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MediaEvent {
     pub key: Media,
     pub pressed: bool,
-}
-
-impl MediaEvent {
-    pub fn encode(self) -> [u8; 2] {
-        [self.key as u8, u8::from(self.pressed)]
-    }
-
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let [tag, pressed] = <[u8; 2]>::try_from(bytes).ok()?;
-        Some(Self {
-            key: Media::from_tag(tag)?,
-            pressed: match pressed {
-                0 => false,
-                1 => true,
-                _ => return None,
-            },
-        })
-    }
 }
 
 /// Travel from touch-down position that counts as a swipe.
@@ -366,32 +318,5 @@ mod tests {
             out,
             [ev(Media::VolumeDown, true), ev(Media::VolumeDown, false)]
         );
-    }
-
-    #[test]
-    fn wire_codec_roundtrips_and_rejects_garbage() {
-        for key in [
-            Media::NextTrack,
-            Media::PrevTrack,
-            Media::PlayPause,
-            Media::VolumeUp,
-            Media::VolumeDown,
-        ] {
-            let event = ev(key, true);
-            assert_eq!(MediaEvent::decode(&event.encode()), Some(event));
-        }
-        assert_eq!(MediaEvent::decode(&[9, 1]), None);
-        assert_eq!(MediaEvent::decode(&[0, 2]), None);
-        assert_eq!(MediaEvent::decode(&[]), None);
-    }
-
-    #[test]
-    fn contact_codec_roundtrips_and_rejects_garbage() {
-        for touching in [false, true] {
-            assert_eq!(decode_contact(&encode_contact(touching)), Some(touching));
-        }
-        assert_eq!(decode_contact(&[2]), None);
-        assert_eq!(decode_contact(&[]), None);
-        assert_eq!(decode_contact(&[1, 0]), None);
     }
 }

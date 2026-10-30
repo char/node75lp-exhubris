@@ -3,7 +3,7 @@ use core::{
     ptr::{addr_of_mut, read_volatile, write_volatile},
 };
 
-use node75_board_api::{LightingPins, Node75Board};
+use node75_ipc::board::{LightingPins, Node75Board};
 use node75_lighting_effects::{FRAME_BYTES, LEDS, Rgb, encode};
 
 use crate::board::Clock;

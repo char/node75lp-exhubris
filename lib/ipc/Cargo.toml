@@ -1,5 +1,5 @@
 [package]
-name = "node75-board-api"
+name = "node75-ipc"
 version = "0.1.0"
 edition = "2024"
 

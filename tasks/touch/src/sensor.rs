@@ -2,7 +2,7 @@
 //! PB20/PB21 carry I2C; PA7 is the active-low ready signal.
 
 use hubris_task_slots::SLOTS;
-use node75_board_api::Node75Board;
+use node75_ipc::board::Node75Board;
 const PRODUCT: u16 = 863;
 const STATUS_ATI_ACTIVE: u8 = 1 << 0;
 const STATUS_ATI_ERROR: u8 = 1 << 1;

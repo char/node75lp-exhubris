@@ -11,7 +11,6 @@ task keyboard {
     stack-size 4096
     priority 0
     uses-peripheral trusted-board-io
-    uses-task keyboard
     uses-task board
     uses-task lighting
     uses-task touch

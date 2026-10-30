@@ -3,18 +3,17 @@
 
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
-use node75_keyboard_core::Debouncer;
+use core::mem::MaybeUninit;
+
+use hubris_task_slots::SLOTS;
+use idyll_runtime::Meta;
+use node75_keyboard_core::{Debouncer, Matrix};
+use node75_keymap::Keymap;
 use node75_usb::{Action, Device, Report};
+use userlib::{ReplyFaultReason, TaskId};
 
 mod usb_hw;
-
-mod lighting_bridge;
-
-mod media_bridge;
-
-mod matrix_bridge;
-
-mod replies;
+include!(concat!(env!("OUT_DIR"), "/server.rs"));
 
 mod board {
     pub struct Clock;
@@ -26,8 +25,11 @@ mod board {
     }
 }
 
-// Bit 0 is reserved for supervisor fault notifications.
+// As task 0, the kernel reports every other task's faults on bit 0.
+const FAULT: u32 = 1 << 0;
 const POLL_TIMER: u32 = 1 << 1;
+// A board task that stops scanning without faulting must not leave keys held.
+const STALE_MS: u32 = 250;
 
 #[unsafe(no_mangle)]
 static mut USB_LEDS: u8 = 0;
@@ -52,17 +54,19 @@ fn main() -> ! {
 
 fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
     let mut hardware = unsafe { usb_hw::Usb::new(&clock) };
-    let mut device = Device::default();
-    device.set_telemetry(telemetry);
-    let mut debounce = Debouncer::default();
-    let mut keymap = node75_keymap::Keymap::new();
-    let mut matrix = matrix_bridge::MatrixBridge::new();
-    let mut pending_matrix = None;
-    let mut keys = [0; 6];
-    let mut observe = lighting_bridge::observer();
-    let mut touching = false;
+    let mut keyboard = Keyboard {
+        device: Device::default(),
+        debounce: Debouncer::default(),
+        keymap: Keymap::new(),
+        keys: [0; 6],
+        sampled_at: None,
+        touching: false,
+    };
+    keyboard.device.set_telemetry(telemetry);
+    let mut incoming = [MaybeUninit::uninit(); NODE_75_KEYBOARD_BUFFER_SIZE];
     loop {
-        let mut now = clock.millis();
+        let now = clock.millis();
+        let device = &mut keyboard.device;
         // A continuously active host must not prevent other tasks from running.
         for _ in 0..16 {
             let Some(event) = hardware.poll() else { break };
@@ -100,27 +104,6 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
             unsafe { write_volatile(addr_of_mut!(USB_LEDS), device.leds()) };
             hardware.finish_event();
         }
-        match pending_matrix.take().or_else(|| matrix.receive(now)) {
-            Some(matrix_bridge::Event::Sample(sample)) => {
-                keys = debounce.update(sample.keys, sample.now);
-            }
-            Some(matrix_bridge::Event::Lost) => {
-                keys = [0; 6];
-                debounce = Debouncer::default();
-                keymap = node75_keymap::Keymap::new();
-                device.set_report(Report::default());
-            }
-            None => {}
-        }
-        now = clock.millis();
-        keymap.update(keys, now, |resolved| {
-            device.set_report(Report::new(resolved.modifiers, resolved.usages()));
-        });
-        media_bridge::receive(&mut device, &mut touching);
-        if !matrix.available() {
-            device.cancel_consumer();
-            touching = false;
-        }
         if let Some(report) = device.report_due(now)
             && hardware.transmit(1, device.report_packet(report).as_slice())
         {
@@ -131,17 +114,101 @@ fn run(clock: board::Clock, telemetry: [u8; 16]) -> ! {
         {
             device.consumer_queued(u16::from_le_bytes(report));
         }
-        observe(node75_lighting_api::State {
-            keys,
-            now,
-            active: device.active(),
-            leds: device.leds(),
-            touching,
+        if keyboard
+            .sampled_at
+            .is_some_and(|at| now.wrapping_sub(at) >= STALE_MS)
+        {
+            keyboard.release_inputs();
+        }
+        userlib::sys_set_timer(Some(userlib::sys_get_timer().now + 1), POLL_TIMER);
+        idyll_runtime::dispatch_or_event(&mut keyboard, FAULT | POLL_TIMER, &mut incoming);
+    }
+}
+
+struct Keyboard {
+    device: Device,
+    debounce: Debouncer,
+    keymap: Keymap,
+    keys: Matrix,
+    sampled_at: Option<u32>,
+    touching: bool,
+}
+
+impl Keyboard {
+    fn release_inputs(&mut self) {
+        self.debounce = Debouncer::default();
+        self.keymap = Keymap::new();
+        self.keys = [0; 6];
+        self.sampled_at = None;
+        self.touching = false;
+        self.device.set_report(Report::default());
+        self.device.cancel_consumer();
+    }
+}
+
+impl idyll_runtime::NotificationHandler for Keyboard {
+    fn handle_notification(&mut self, bits: u32) {
+        if bits & FAULT == 0 {
+            return;
+        }
+        let mut next = 1;
+        while let Some(index) = kipc::find_faulted_task(next) {
+            let index = index.get();
+            if index == usize::from(SLOTS.board.task_index())
+                || index == usize::from(SLOTS.touch.task_index())
+            {
+                self.release_inputs();
+            }
+            kipc::reinitialize_task(index, kipc::NewState::Runnable);
+            next = index + 1;
+        }
+    }
+}
+
+fn expect(meta: &Meta, client: TaskId) -> Result<(), ReplyFaultReason> {
+    if meta.sender.task_index() == client.task_index() {
+        Ok(())
+    } else {
+        Err(ReplyFaultReason::AccessViolation)
+    }
+}
+
+impl Node75Keyboard for Keyboard {
+    fn matrix_sample(
+        &mut self,
+        meta: Meta,
+        keys: [u16; 6],
+        now: u32,
+    ) -> Result<(), ReplyFaultReason> {
+        expect(&meta, SLOTS.board)?;
+        self.keys = self.debounce.update(keys, now);
+        self.sampled_at = Some(now);
+        let device = &mut self.device;
+        self.keymap.update(self.keys, now, |resolved| {
+            device.set_report(Report::new(resolved.modifiers, resolved.usages()));
         });
-        // Leave CPU time for optional drivers, even if they stop making syscalls.
-        let time = userlib::sys_get_timer().now;
-        userlib::sys_set_timer(Some(time + 1), POLL_TIMER);
-        // Accept samples immediately so the board server can keep serving I2C/GPIO.
-        pending_matrix = matrix.wait(POLL_TIMER);
+        Ok(())
+    }
+
+    fn media_key(&mut self, meta: Meta, usage: u16) -> Result<bool, ReplyFaultReason> {
+        expect(&meta, SLOTS.touch)?;
+        Ok(self.device.enqueue_consumer(usage))
+    }
+
+    fn set_contact(&mut self, meta: Meta, touching: bool) -> Result<(), ReplyFaultReason> {
+        expect(&meta, SLOTS.touch)?;
+        self.touching = touching;
+        Ok(())
+    }
+
+    fn lighting_state(&mut self, meta: Meta) -> Result<LightingState, ReplyFaultReason> {
+        expect(&meta, SLOTS.lighting)?;
+        Ok(LightingState {
+            keys: self.keys,
+            now: userlib::sys_get_timer().now as u32,
+            active: self.device.active(),
+            leds: self.device.leds(),
+            touching: self.touching,
+        })
     }
 }
