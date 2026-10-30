@@ -108,10 +108,10 @@ index cfb1db78cc6f5827c757834d99e6b12505afdb12..5e5e0c4c0117608c19587e24acec9021
      }
 diff --git a/sys/kern/src/arch/ch582.rs b/sys/kern/src/arch/ch582.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..e7cdd386e51c989541ced55e2b425e04a98068ed
+index 0000000000000000000000000000000000000000..dd67ccce694f879f2cc2ee29dbb3faa768e5b74a
 --- /dev/null
 +++ b/sys/kern/src/arch/ch582.rs
-@@ -0,0 +1,353 @@
+@@ -0,0 +1,348 @@
 +// This Source Code Form is subject to the terms of the Mozilla Public
 +// License, v. 2.0. If a copy of the MPL was not distributed with this
 +// file, You can obtain one at https://mozilla.org/MPL/2.0/.
@@ -129,7 +129,7 @@ index 0000000000000000000000000000000000000000..e7cdd386e51c989541ced55e2b425e04
 +use abi::{FaultInfo, FaultSource, InterruptNum, IrqStatus, UsageError};
 +use core::{
 +    arch::{asm, global_asm},
-+    ptr::{read_volatile, write_volatile},
++    ptr::write_volatile,
 +    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
 +};
 +
@@ -230,43 +230,33 @@ index 0000000000000000000000000000000000000000..e7cdd386e51c989541ced55e2b425e04
 +    CYCLES_PER_TICK.store(divisor, Ordering::Relaxed);
 +}
 +
-+fn cycles() -> u64 {
-+    unsafe {
-+        loop {
-+            let high = read_volatile((SYSTICK + 12) as *const u32);
-+            let low = read_volatile((SYSTICK + 8) as *const u32);
-+            if read_volatile((SYSTICK + 12) as *const u32) == high {
-+                return (u64::from(high) << 32) | u64::from(low);
-+            }
-+        }
-+    }
-+}
++/// Low and high words of the tick count. Like the ARM-M port, this avoids
++/// software 64-bit division on every tick and timer syscall, which is costly
++/// when running from this chip's flash. Only accessed with interrupts disabled.
++static TICKS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 +
 +pub fn now() -> Timestamp {
-+    Timestamp::from(
-+        cycles() / u64::from(CYCLES_PER_TICK.load(Ordering::Relaxed)),
-+    )
++    Timestamp::from([
++        TICKS[0].load(Ordering::Relaxed),
++        TICKS[1].load(Ordering::Relaxed),
++    ])
 +}
 +
-+fn arm_tick() {
-+    let divisor = u64::from(CYCLES_PER_TICK.load(Ordering::Relaxed));
++fn tick() -> Timestamp {
 +    unsafe {
-+        // Keep the monotonic counter running; anchor interrupts to millisecond boundaries.
 +        write_volatile((SYSTICK + 4) as *mut u32, 0);
 +        write_volatile((PFIC + 0x280) as *mut u32, SYSTICK_IRQ);
-+        loop {
-+            let deadline = (cycles() / divisor + 1) * divisor;
-+            write_volatile((SYSTICK + 20) as *mut u32, u32::MAX);
-+            write_volatile((SYSTICK + 16) as *mut u32, deadline as u32);
-+            write_volatile((SYSTICK + 20) as *mut u32, (deadline >> 32) as u32);
-+            if cycles() < deadline {
-+                break;
-+            }
-+            // A comparison reached during the split write must not lose the next tick.
-+            write_volatile((SYSTICK + 4) as *mut u32, 0);
-+            write_volatile((PFIC + 0x280) as *mut u32, SYSTICK_IRQ);
-+        }
 +    }
++    let low = TICKS[0].load(Ordering::Relaxed).wrapping_add(1);
++    TICKS[0].store(low, Ordering::Relaxed);
++    if low == 0 {
++        let high = TICKS[1].load(Ordering::Relaxed);
++        TICKS[1].store(
++            high.checked_add(1).expect("tick overflow"),
++            Ordering::Relaxed,
++        );
++    }
++    now()
 +}
 +
 +pub fn reinitialize(task: &mut Task) {
@@ -368,8 +358,13 @@ index 0000000000000000000000000000000000000000..e7cdd386e51c989541ced55e2b425e04
 +        }
 +        write_volatile((PFIC + 0x40) as *mut u32, 0);
 +        write_volatile((PFIC + 0x40c) as *mut u8, 0);
-+        arm_tick();
-+        write_volatile(SYSTICK as *mut u32, 0x07); // HCLK, no reload, IRQ enabled.
++        // Interrupt once per tick and restart from zero. A tick is lost only if the
++        // kernel keeps interrupts masked for a whole tick.
++        let period = CYCLES_PER_TICK.load(Ordering::Relaxed) - 1;
++        write_volatile((SYSTICK + 16) as *mut u32, period);
++        write_volatile((SYSTICK + 20) as *mut u32, 0);
++        write_volatile((SYSTICK + 4) as *mut u32, 0);
++        write_volatile(SYSTICK as *mut u32, 0x2f); // INIT, reload, HCLK, IRQ, enable.
 +        write_volatile((PFIC + 0x100) as *mut u32, SYSTICK_IRQ);
 +        set_current_task(task);
 +        ch582_restore(CURRENT_TASK_PTR.load(Ordering::Relaxed).cast())
@@ -394,9 +389,9 @@ index 0000000000000000000000000000000000000000..e7cdd386e51c989541ced55e2b425e04
 +        )
 +    };
 +    if cause == SYSTICK_CAUSE {
-+        arm_tick();
++        let now = tick();
 +        with_task_table(|tasks| {
-+            let _ = task::process_timers(tasks, now());
++            let _ = task::process_timers(tasks, now);
 +        });
 +    } else if cause == 8 {
 +        let saved = unsafe { &mut *current }.save_mut();
