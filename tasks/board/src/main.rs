@@ -7,7 +7,7 @@ use core::{
 };
 use hubris_task_slots::SLOTS;
 use idyll_runtime::{Leased, Meta, Read, Write};
-use node75_board_api::{GpioWrite, MAX_I2C_BYTES, MAX_WRITES, Register};
+use node75_board_api::MAX_I2C_BYTES;
 use node75_keyboard_core::{MATRIX_SAMPLE, MatrixSample};
 use userlib::{ReplyFaultReason, TaskId};
 
@@ -18,6 +18,11 @@ const TICK: u32 = 1;
 const PA: usize = 0x4000_10a0;
 const PB: usize = 0x4000_10c0;
 const RDY: u32 = 1 << 7;
+const CLEAR: usize = 12;
+const PULL_UP: usize = 16;
+const PULL_DOWN: usize = 20;
+const LED_DATA: u32 = 1 << 14;
+const LED_POWER: u32 = 1 << 15;
 
 #[unsafe(export_name = "main")]
 fn main() -> ! {
@@ -28,10 +33,9 @@ fn main() -> ! {
     unsafe {
         let analog = 0x4000_101a as *mut u16;
         write_volatile(analog, read_volatile(analog) & !0x0008);
-        for (offset, clear, set) in [(0, RDY, 0), (20, RDY, 0), (16, 0, RDY)] {
-            let register = (PA + offset) as *mut u32;
-            write_volatile(register, (read_volatile(register) & !clear) | set);
-        }
+        update(PA, RDY, 0);
+        update(PA + PULL_DOWN, RDY, 0);
+        update(PA + PULL_UP, 0, RDY);
     }
     userlib::sys_set_timer(Some(userlib::sys_get_timer().now), TICK);
     let mut incoming = [MaybeUninit::uninit(); NODE_75_BOARD_BUFFER_SIZE];
@@ -125,51 +129,38 @@ impl Node75Board for Server {
         }))
     }
 
-    fn apply_writes(
+    fn set_lighting_pins(
         &mut self,
         meta: Meta,
-        writes: Leased<Read, GpioWrite>,
-    ) -> Result<Result<(), BoardError>, ReplyFaultReason> {
-        authorize(meta, SLOTS.lighting, 1)?;
-        if writes.len() > MAX_WRITES {
-            return Ok(Err(BoardError::TooLong));
-        }
-        let mut batch = [GpioWrite::new(Register::DirectionB, 0, 0); MAX_WRITES];
-        let batch = &mut batch[..writes.len()];
-        writes
-            .read_range(0, batch)
-            .map_err(|_| ReplyFaultReason::BadLeases)?;
-        // Reject the entire batch before touching hardware, using our own stable copy.
-        if batch.iter().any(|write| write.register().is_none()) {
-            return Err(ReplyFaultReason::BadMessageContents);
-        }
-        for write in batch {
-            unsafe {
-                match write.register().expect("validated batch") {
-                    Register::PinAlternate => {
-                        let register = 0x4000_1018 as *mut u16;
-                        write_volatile(
-                            register,
-                            (read_volatile(register) & !(write.clear as u16)) | write.set as u16,
-                        );
-                    }
-                    Register::ClearB => write_volatile((PB + 12) as *mut u32, write.set),
-                    register => {
-                        let offset = match register {
-                            Register::DirectionB => 0,
-                            Register::PullUpB => 16,
-                            Register::PullDownB => 20,
-                            _ => unreachable!(),
-                        };
-                        let register = (PB + offset) as *mut u32;
-                        write_volatile(
-                            register,
-                            (read_volatile(register) & !write.clear) | write.set,
-                        );
+        pins: LightingPins,
+    ) -> Result<(), ReplyFaultReason> {
+        authorize(meta, SLOTS.lighting, 0)?;
+        let both = LED_POWER | LED_DATA;
+        unsafe {
+            match pins {
+                // Stock enables lighting by driving the power pin low.
+                LightingPins::Powered => {
+                    write_volatile((PB + CLEAR) as *mut u32, both);
+                    update(PB + PULL_DOWN, both, 0);
+                    update(PB, 0, both);
+                }
+                LightingPins::Spi => {
+                    let alternate = 0x4000_1018 as *mut u16;
+                    write_volatile(alternate, read_volatile(alternate) | 0x100);
+                }
+                LightingPins::Off => {
+                    write_volatile((PB + CLEAR) as *mut u32, LED_DATA);
+                    for offset in [PULL_UP, PULL_DOWN, 0] {
+                        update(PB + offset, LED_POWER, 0);
                     }
                 }
             }
         }
-        Ok(Ok(()))
+        Ok(())
     }
+}
+
+unsafe fn update(address: usize, clear: u32, set: u32) {
+    let register = address as *mut u32;
+    unsafe { write_volatile(register, (read_volatile(register) & !clear) | set) };
 }

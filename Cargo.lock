@@ -1188,7 +1188,6 @@ dependencies = [
  "node75-matrix",
  "serde",
  "userlib",
- "zerocopy 0.8.63",
 ]
 
 [[package]]

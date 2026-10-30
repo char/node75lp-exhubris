@@ -3,14 +3,12 @@ use core::{
     ptr::{addr_of_mut, read_volatile, write_volatile},
 };
 
-use node75_board_api::{GpioWrite, Node75Board, Register};
+use node75_board_api::{LightingPins, Node75Board};
 use node75_lighting_effects::{FRAME_BYTES, LEDS, Rgb, encode};
 
 use crate::board::Clock;
 
 const SPI: usize = 0x4000_4000;
-const DATA_PIN: u32 = 1 << 14;
-const POWER_PIN: u32 = 1 << 15;
 const FRAME_MS: u32 = 8;
 
 #[repr(C, align(4))]
@@ -62,21 +60,12 @@ impl Lights {
         unsafe {
             let force = match self.state {
                 State::Off => {
-                    // Stock enables lighting by driving PB15 low; off releases it.
-                    self.gpio
-                        .apply_writes(&[
-                            GpioWrite::new(Register::ClearB, 0, POWER_PIN | DATA_PIN),
-                            GpioWrite::new(Register::PullDownB, POWER_PIN | DATA_PIN, 0),
-                            GpioWrite::new(Register::DirectionB, 0, POWER_PIN | DATA_PIN),
-                        ])
-                        .expect("lighting GPIO");
+                    self.gpio.set_lighting_pins(LightingPins::Powered);
                     self.state = State::Powering(userlib::sys_get_timer().now as u32);
                     return;
                 }
                 State::Powering(since) if now.wrapping_sub(since) >= 2 => {
-                    self.gpio
-                        .apply_writes(&[GpioWrite::new(Register::PinAlternate, 0, 0x100)])
-                        .expect("lighting pin mux");
+                    self.gpio.set_lighting_pins(LightingPins::Spi);
                     write_volatile((SPI + 3) as *mut u8, 7);
                     write_volatile(SPI as *mut u8, 2);
                     write_volatile(SPI as *mut u8, 0x40);
@@ -121,14 +110,7 @@ impl Lights {
             write_volatile((SPI + 2) as *mut u8, 0);
             write_volatile(SPI as *mut u8, 2);
             write_volatile(SPI as *mut u8, 0);
-            self.gpio
-                .apply_writes(&[
-                    GpioWrite::new(Register::ClearB, 0, DATA_PIN),
-                    GpioWrite::new(Register::PullUpB, POWER_PIN, 0),
-                    GpioWrite::new(Register::PullDownB, POWER_PIN, 0),
-                    GpioWrite::new(Register::DirectionB, POWER_PIN, 0),
-                ])
-                .expect("lighting power off");
+            self.gpio.set_lighting_pins(LightingPins::Off);
         }
     }
 }
