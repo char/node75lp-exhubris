@@ -1,5 +1,8 @@
 add full RV32 / CH582 support to hubris-build
 
+the task linker scripts gain RISC-V small-data sections and gp; these are
+inert on ARM
+
 diff --git a/files/kernel-ch582.x b/files/kernel-ch582.x
 new file mode 100644
 index 0000000000000000000000000000000000000000..2d08df8c0a0499135a9cc2ea88d5ab3065e953a3
@@ -86,354 +89,81 @@ index 0000000000000000000000000000000000000000..2d08df8c0a0499135a9cc2ea88d5ab30
 +ASSERT(ORIGIN(RAM) >= _stack_top, "kernel RAM overlaps stack");
 +ASSERT(ORIGIN(RAM) + LENGTH(RAM) <= 0x20008000, "RAM exceeds CH582 capacity");
 +ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= 0x58AF0, "image exceeds conservative stock bound");
-diff --git a/files/task-link2-riscv.x b/files/task-link2-riscv.x
-new file mode 100644
-index 0000000000000000000000000000000000000000..6b7ebfd3538002b2003a957dfaee8da84d5894f4
---- /dev/null
-+++ b/files/task-link2-riscv.x
-@@ -0,0 +1,112 @@
-+/* Linker script for a temporary link operation, used to measure task size
-+ * (but without flash fill) */
-+INCLUDE memory.x
-+
-+OUTPUT_ARCH(riscv)
-+ENTRY(_start);
-+
-+SECTIONS
-+{
-+  PROVIDE(_stack_start = ORIGIN(STACK) + LENGTH(STACK));
-+
-+  /* ### .text */
-+  .text : {
-+    _stext = .;
-+    *(.text.start*); /* try and pull start symbol to beginning */
-+    *(.text .text.*);
-+    . = ALIGN(4);
-+    __etext = .;
-+  } > FLASH =0xdededede
-+
-+  /* ### .rodata */
-+  .rodata : ALIGN(4)
-+  {
-+    *(.rodata .rodata.*);
-+
-+    /* 4-byte align the end (VMA) of this section.
-+       This is required by LLD to ensure the LMA of the following .data
-+       section will have the correct alignment. */
-+    . = ALIGN(4);
-+    __erodata = .;
-+  } > FLASH
-+
-+  /*
-+   * Sections in RAM
-+   *
-+   * NOTE: the userlib runtime assumes that these sections
-+   * are 4-byte aligned and padded to 4-byte boundaries.
-+   */
-+  .data : ALIGN(4) {
-+    . = ALIGN(4);
-+    __sdata = .;
+diff --git a/files/task-link2.x b/files/task-link2.x
+index 6c6dba38eb942a38b414235a0db82b4a4dccebae..0267ea7980f21e88b7700519a48c809a227f9b9e 100644
+--- a/files/task-link2.x
++++ b/files/task-link2.x
+@@ -38,9 +38,12 @@ SECTIONS
+   .data : ALIGN(4) {
+     . = ALIGN(4);
+     __sdata = .;
 +    *(.sdata .sdata.*);
-+    *(.data .data.*);
-+    . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
-+    __edata = .;
+     *(.data .data.*);
+     . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
+     __edata = .;
++    /* RISC-V linker relaxation addresses small data relative to gp. */
 +    __global_pointer$ = __sdata + 0x800;
-+  } > RAM AT>FLASH
-+
-+  /* LMA of .data */
-+  __sidata = LOADADDR(.data);
-+
-+  .stack (NOLOAD) : ALIGN(4)
-+  {
-+    . += LENGTH(STACK);
-+  } > STACK
-+
-+  .bss (NOLOAD) : ALIGN(4)
-+  {
-+    . = ALIGN(4);
-+    __sbss = .;
+   } > RAM AT>FLASH
+ 
+   /* LMA of .data */
+@@ -55,6 +58,7 @@ SECTIONS
+   {
+     . = ALIGN(4);
+     __sbss = .;
 +    *(.sbss .sbss.*);
-+    *(.bss .bss.*);
-+    . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
-+    __ebss = .;
-+  } > RAM
-+
-+  .uninit (NOLOAD) : ALIGN(4)
-+  {
-+    . = ALIGN(4);
-+    *(.uninit .uninit.*);
-+    . = ALIGN(4);
-+    /* Place the heap right after `.uninit` */
-+    __sheap = .;
-+  } > RAM
-+
-+  /* ## .task_slot_table */
-+  /* Table of TaskSlot instances and their names. Used to resolve task
-+     dependencies during packaging. */
-+  .task_slot_table (INFO) : {
-+    . = .;
-+    KEEP(*(.task_slot_table));
-+  }
-+
-+  /* ## .caboose_pos_table */
-+  /* Table of CaboosePos instances and their names. Used to record caboose
-+     position during packaging. */
-+  .caboose_pos_table (INFO) : {
-+    . = .;
-+    KEEP(*(.caboose_pos_table));
-+  }
-+
-+  .hubris_abi_version (INFO) : {
-+    . = .;
-+    KEEP(*(.hubris_abi_version));
-+  }
-+
-+  /* ## .idolatry */
-+  .idolatry (INFO) : {
-+    . = .;
-+    KEEP(*(.idolatry));
-+  }
-+
-+  /* ## Discarded sections */
-+  /DISCARD/ :
-+  {
-+    /* Unused exception related info that only wastes space */
-+    *(.ARM.exidx);
-+    *(.ARM.exidx.*);
-+    *(.ARM.extab.*);
-+    *(.got .got.*);
-+  }
-+}
-diff --git a/files/task-link3-riscv.x b/files/task-link3-riscv.x
-new file mode 100644
-index 0000000000000000000000000000000000000000..62db94103b7b10c8b277adaad11c64db523be458
---- /dev/null
-+++ b/files/task-link3-riscv.x
-@@ -0,0 +1,117 @@
-+/* Linker script for a temporary link operation, used to measure task size
-+ * (but without flash fill) */
-+INCLUDE memory.x
-+
-+OUTPUT_ARCH(riscv)
-+ENTRY(_start);
-+
-+SECTIONS
-+{
-+  PROVIDE(_stack_start = ORIGIN(STACK) + LENGTH(STACK));
-+
-+  /* ### .text */
-+  .text : {
-+    _stext = .;
-+    *(.text.start*); /* try and pull start symbol to beginning */
-+    *(.text .text.*);
-+    . = ALIGN(4);
-+    __etext = .;
-+  } > FLASH =0xdededede
-+
-+  /* ### .rodata */
-+  .rodata : ALIGN(4)
-+  {
-+    *(.rodata .rodata.*);
-+
-+    /* 4-byte align the end (VMA) of this section.
-+       This is required by LLD to ensure the LMA of the following .data
-+       section will have the correct alignment. */
-+    . = ALIGN(4);
-+    __erodata = .;
-+  } > FLASH
-+
-+  /*
-+   * Sections in RAM
-+   *
-+   * NOTE: the userlib runtime assumes that these sections
-+   * are 4-byte aligned and padded to 4-byte boundaries.
-+   */
-+  .data : ALIGN(4) {
-+    . = ALIGN(4);
-+    __sdata = .;
+     *(.bss .bss.*);
+     . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
+     __ebss = .;
+diff --git a/files/task-link3.x b/files/task-link3.x
+index 1a26c45f3d26ed4fa8f7cdb2080721b7364a5776..a0c6df460485eafd989b8ba10955e9efc73ca863 100644
+--- a/files/task-link3.x
++++ b/files/task-link3.x
+@@ -38,9 +38,12 @@ SECTIONS
+   .data : ALIGN(4) {
+     . = ALIGN(4);
+     __sdata = .;
 +    *(.sdata .sdata.*);
-+    *(.data .data.*);
-+    . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
-+    __edata = .;
+     *(.data .data.*);
+     . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
+     __edata = .;
++    /* RISC-V linker relaxation addresses small data relative to gp. */
 +    __global_pointer$ = __sdata + 0x800;
-+  } > RAM AT>FLASH
-+
-+  /* LMA of .data */
-+  __sidata = LOADADDR(.data);
-+
-+  .fill (LOADADDR(.data) + SIZEOF(.data)) : AT(LOADADDR(.data) + SIZEOF(.data))
-+  {
-+    . = ORIGIN(FLASH) + LENGTH(FLASH);
-+  } >FLASH =0xffffffff
-+
-+  .stack (NOLOAD) : ALIGN(4)
-+  {
-+    . += LENGTH(STACK);
-+  } > STACK
-+
-+  .bss (NOLOAD) : ALIGN(4)
-+  {
-+    . = ALIGN(4);
-+    __sbss = .;
+   } > RAM AT>FLASH
+ 
+   /* LMA of .data */
+@@ -60,6 +63,7 @@ SECTIONS
+   {
+     . = ALIGN(4);
+     __sbss = .;
 +    *(.sbss .sbss.*);
-+    *(.bss .bss.*);
-+    . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
-+    __ebss = .;
-+  } > RAM
-+
-+  .uninit (NOLOAD) : ALIGN(4)
-+  {
-+    . = ALIGN(4);
-+    *(.uninit .uninit.*);
-+    . = ALIGN(4);
-+    /* Place the heap right after `.uninit` */
-+    __sheap = .;
-+  } > RAM
-+
-+  /* ## .task_slot_table */
-+  /* Table of TaskSlot instances and their names. Used to resolve task
-+     dependencies during packaging. */
-+  .task_slot_table (INFO) : {
-+    . = .;
-+    KEEP(*(.task_slot_table));
-+  }
-+
-+  /* ## .caboose_pos_table */
-+  /* Table of CaboosePos instances and their names. Used to record caboose
-+     position during packaging. */
-+  .caboose_pos_table (INFO) : {
-+    . = .;
-+    KEEP(*(.caboose_pos_table));
-+  }
-+
-+  .hubris_abi_version (INFO) : {
-+    . = .;
-+    KEEP(*(.hubris_abi_version));
-+  }
-+
-+  /* ## .idolatry */
-+  .idolatry (INFO) : {
-+    . = .;
-+    KEEP(*(.idolatry));
-+  }
-+
-+  /* ## Discarded sections */
-+  /DISCARD/ :
-+  {
-+    /* Unused exception related info that only wastes space */
-+    *(.ARM.exidx);
-+    *(.ARM.exidx.*);
-+    *(.ARM.extab.*);
-+    *(.got .got.*);
-+  }
-+}
-diff --git a/files/task-rlink-riscv.x b/files/task-rlink-riscv.x
-new file mode 100644
-index 0000000000000000000000000000000000000000..1318b9fb3152b528112302362112115573eeb04e
---- /dev/null
-+++ b/files/task-rlink-riscv.x
-@@ -0,0 +1,101 @@
-+/* Linker script for a relocatable task
-+ * This should be used with the `-r` linker flag */
-+OUTPUT_ARCH(riscv)
-+ENTRY(_start);
-+
-+SECTIONS
-+{
-+  /* ### .text */
-+  .text : {
-+    _stext = .;
-+    *(.text.start*); /* try and pull start symbol to beginning */
-+    *(.text .text.*);
-+    . = ALIGN(4);
-+    __etext = .;
-+  }
-+
-+  /* ### .rodata */
-+  .rodata : ALIGN(4)
-+  {
-+    *(.rodata .rodata.*);
-+
-+    /* 4-byte align the end (VMA) of this section.
-+       This is required by LLD to ensure the LMA of the following .data
-+       section will have the correct alignment. */
-+    . = ALIGN(4);
-+    __erodata = .;
-+  }
-+
-+  /*
-+   * Sections in RAM
-+   *
-+   * NOTE: the userlib runtime assumes that these sections
-+   * are 4-byte aligned and padded to 4-byte boundaries.
-+   */
-+  .data : ALIGN(4) {
-+    . = ALIGN(4);
-+    __sdata = .;
+     *(.bss .bss.*);
+     . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
+     __ebss = .;
+diff --git a/files/task-rlink.x b/files/task-rlink.x
+index 6362f20a0845c507aef8fcaf070ced0affa306f8..7b01cb738c05d3d67d519d070943a2ca427a725a 100644
+--- a/files/task-rlink.x
++++ b/files/task-rlink.x
+@@ -34,9 +34,12 @@ SECTIONS
+   .data : ALIGN(4) {
+     . = ALIGN(4);
+     __sdata = .;
 +    *(.sdata .sdata.*);
-+    *(.data .data.*);
-+    . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
-+    __edata = .;
+     *(.data .data.*);
+     . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
+     __edata = .;
++    /* RISC-V linker relaxation addresses small data relative to gp. */
 +    __global_pointer$ = __sdata + 0x800;
-+  }
-+
-+  /* LMA of .data */
-+  __sidata = LOADADDR(.data);
-+
-+  .bss (NOLOAD) : ALIGN(4) {
-+    . = ALIGN(4);
-+    __sbss = .;
+   }
+ 
+   /* LMA of .data */
+@@ -45,6 +48,7 @@ SECTIONS
+   .bss (NOLOAD) : ALIGN(4) {
+     . = ALIGN(4);
+     __sbss = .;
 +    *(.sbss .sbss.*);
-+    *(.bss .bss.*);
-+    . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
-+    __ebss = .;
-+  }
-+
-+  .uninit (NOLOAD) : ALIGN(4) {
-+    . = ALIGN(4);
-+    *(.uninit .uninit.*);
-+    . = ALIGN(4);
-+    /* Place the heap right after `.uninit` */
-+    __sheap = .;
-+  }
-+
-+  /* ## .task_slot_table */
-+  /* Table of TaskSlot instances and their names. Used to resolve task
-+     dependencies during packaging. */
-+  .task_slot_table (INFO) : {
-+    . = .;
-+    KEEP(*(.task_slot_table));
-+  }
-+
-+  /* ## .caboose_pos_table */
-+  /* Table of CaboosePos instances and their names. Used to record caboose
-+     position during packaging. */
-+  .caboose_pos_table (INFO) : {
-+    . = .;
-+    KEEP(*(.caboose_pos_table));
-+  }
-+
-+  .hubris_abi_version (INFO) : {
-+    . = .;
-+    KEEP(*(.hubris_abi_version));
-+  }
-+
-+  /* ## .idolatry */
-+  .idolatry (INFO) : {
-+    . = .;
-+    KEEP(*(.idolatry));
-+  }
-+
-+  /* ## Discarded sections */
-+  /DISCARD/ :
-+  {
-+    /* Unused exception related info that only wastes space */
-+    *(.ARM.exidx);
-+    *(.ARM.exidx.*);
-+    *(.ARM.extab.*);
-+    *(.got .got.*);
-+  }
-+}
+     *(.bss .bss.*);
+     . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
+     __ebss = .;
 diff --git a/tools/build/src/cargo.rs b/tools/build/src/cargo.rs
 index 9af46196ae5072288b179aea45656e6baebaa03d..50eaa82f41ffd152e9cad22a745401a03ce00097 100644
 --- a/tools/build/src/cargo.rs
@@ -654,21 +384,10 @@ index 30f8b332f7151a371d32b07a676f7c9c7cf1f2e7..0158e2045eb5903c3b2a8e6bb84789c1
 +    }
 +}
 diff --git a/tools/build/src/main.rs b/tools/build/src/main.rs
-index 9becd69e5d213c0a909bf6a2eaaf5764a4b27ab1..c417c6f45fcd19615f3a3c707b5281497350420f 100644
+index 9becd69e5d213c0a909bf6a2eaaf5764a4b27ab1..3ef8954b68bb7a2d4798130e95b456fd2a5c9cba 100644
 --- a/tools/build/src/main.rs
 +++ b/tools/build/src/main.rs
-@@ -137,11 +137,17 @@ fn main() -> miette::Result<()> {
-             maybe_create_dir(&initial_build_dir).into_diagnostic()?;
- 
-             // Run the initial build of each task using the task-rlink script.
--            let task_rlink_text = include_str!("../../../files/task-rlink.x");
-+            let is_riscv = app.board.chip.target_triple.value() == "riscv32imac-unknown-none-elf";
-+            let task_rlink_text = if is_riscv {
-+                include_str!("../../../files/task-rlink-riscv.x")
-+            } else {
-+                include_str!("../../../files/task-rlink.x")
-+            };
-             buildid.eat(task_rlink_text.as_bytes());
+@@ -142,6 +142,7 @@ fn main() -> miette::Result<()> {
              for (name, plan) in &overall_plan.tasks {
                  do_cargo_build(
                      task_rlink_text,
@@ -676,37 +395,12 @@ index 9becd69e5d213c0a909bf6a2eaaf5764a4b27ab1..c417c6f45fcd19615f3a3c707b528149
                      plan,
                      LinkStyle::Partial,
                      &targetroot,
-@@ -159,7 +165,11 @@ fn main() -> miette::Result<()> {
-             banner("Task build complete, prelinking for size...");
-             let temp_link_dir = workdir.join("link2");
-             maybe_create_dir(&temp_link_dir).into_diagnostic()?;
--            let task_link2_text = include_str!("../../../files/task-link2.x");
-+            let task_link2_text = if is_riscv {
-+                include_str!("../../../files/task-link2-riscv.x")
-+            } else {
-+                include_str!("../../../files/task-link2.x")
-+            };
-             buildid.eat(task_link2_text.as_bytes());
-             std::fs::write(workdir.join("task-link2.x"), task_link2_text).into_diagnostic()?;
- 
-@@ -207,7 +217,11 @@ fn main() -> miette::Result<()> {
-             }
-             maybe_create_dir(&dir3).into_diagnostic()?;
- 
--            let task_link3_text = include_str!("../../../files/task-link3.x");
-+            let task_link3_text = if is_riscv {
-+                include_str!("../../../files/task-link3-riscv.x")
-+            } else {
-+                include_str!("../../../files/task-link3.x")
-+            };
-             buildid.eat(task_link3_text.as_bytes());
-             std::fs::write(workdir.join("task-link3.x"), task_link3_text).into_diagnostic()?;
- 
-@@ -278,7 +292,11 @@ fn main() -> miette::Result<()> {
+@@ -278,7 +279,12 @@ fn main() -> miette::Result<()> {
              buildid.hash(&overall_plan);
  
              // Generate the kernel linker script on disk and hash it, too.
 -            let kernel_link_text = include_str!("../../../files/kernel-link.x");
++            let is_riscv = app.board.chip.target_triple.value() == "riscv32imac-unknown-none-elf";
 +            let kernel_link_text = if is_riscv {
 +                include_str!("../../../files/kernel-ch582.x")
 +            } else {
@@ -715,7 +409,7 @@ index 9becd69e5d213c0a909bf6a2eaaf5764a4b27ab1..c417c6f45fcd19615f3a3c707b528149
              buildid.eat(kernel_link_text.as_bytes());
              std::fs::write(workdir.join("kernel-link.x"), kernel_link_text).into_diagnostic()?;
  
-@@ -291,6 +309,7 @@ fn main() -> miette::Result<()> {
+@@ -291,6 +297,7 @@ fn main() -> miette::Result<()> {
              // Build the actual kernel.
              do_cargo_build(
                  kernel_link_text,
