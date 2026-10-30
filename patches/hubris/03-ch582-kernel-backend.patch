@@ -108,10 +108,10 @@ index cfb1db78cc6f5827c757834d99e6b12505afdb12..5e5e0c4c0117608c19587e24acec9021
      }
 diff --git a/sys/kern/src/arch/ch582.rs b/sys/kern/src/arch/ch582.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..ba24af8a82253d96256fb1c264e116abed69d6a1
+index 0000000000000000000000000000000000000000..e7cdd386e51c989541ced55e2b425e04a98068ed
 --- /dev/null
 +++ b/sys/kern/src/arch/ch582.rs
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,353 @@
 +// This Source Code Form is subject to the terms of the Mozilla Public
 +// License, v. 2.0. If a copy of the MPL was not distributed with this
 +// file, You can obtain one at https://mozilla.org/MPL/2.0/.
@@ -218,7 +218,13 @@ index 0000000000000000000000000000000000000000..ba24af8a82253d96256fb1c264e116ab
 +pub(crate) unsafe fn set_clock_freq(divisor: u32) {
 +    // Do not let inherited MPRV apply user mappings to kernel data accesses.
 +    unsafe {
-+        asm!("csrc mstatus, {mask}", mask = in(reg) 0x20008u32, options(nostack));
++        let config: u32;
++        asm!(
++            "csrc mstatus, {mask}", "csrr {config}, pmpcfg0",
++            mask = in(reg) 0x20008u32, config = out(reg) config,
++            options(nostack),
++        );
++        assert_eq!(config & 0x80808080, 0, "inherited locked PMP entries");
 +    }
 +    assert!(divisor != 0);
 +    CYCLES_PER_TICK.store(divisor, Ordering::Relaxed);
@@ -296,18 +302,6 @@ index 0000000000000000000000000000000000000000..ba24af8a82253d96256fb1c264e116ab
 +) -> RegionDescExt {
 +    assert!(attributes.bits() & RegionAttributes::RESERVED.bits() == 0);
 +    let permissions = (attributes.bits() & 7) as u8;
-+    let end = match base.checked_add(size) {
-+        Some(end) => end,
-+        None => panic!("CH582 region overflow"),
-+    };
-+    assert!(
-+        permissions == 0
-+            || (base >= 0x13000 && end <= 0x58af0)
-+            || (base >= 0x20000000 && end <= 0x20008000)
-+            || (attributes.contains(RegionAttributes::DEVICE)
-+                && base >= 0x40000000
-+                && end <= 0x40010000)
-+    );
 +    match pmp::encode(base, size, permissions) {
 +        Ok(region) => region,
 +        Err(_) => panic!("invalid CH582 PMP region"),
@@ -318,19 +312,11 @@ index 0000000000000000000000000000000000000000..ba24af8a82253d96256fb1c264e116ab
 +    let mut addresses = [0; 4];
 +    let mut config = 0u32;
 +    for (i, region) in task.region_table().iter().enumerate() {
-+        let encoded = compute_region_extension_data(
-+            region.base,
-+            region.size,
-+            region.attributes,
-+        );
-+        assert_eq!(encoded, region.arch_data);
++        let encoded = region.arch_data;
 +        addresses[i] = encoded.address;
 +        config |= u32::from(encoded.config) << (i * 8);
 +    }
 +    unsafe {
-+        let old: u32;
-+        asm!("csrr {old}, pmpcfg0", old = out(reg) old, options(nostack));
-+        assert_eq!(old & 0x80808080, 0, "inherited locked PMP entries");
 +        asm!(
 +            "csrw pmpcfg0, zero",
 +            "csrw pmpaddr0, {a0}", "csrw pmpaddr1, {a1}",
@@ -341,16 +327,6 @@ index 0000000000000000000000000000000000000000..ba24af8a82253d96256fb1c264e116ab
 +            a2 = in(reg) addresses[2], a3 = in(reg) addresses[3],
 +            config = in(reg) config, options(nostack),
 +        );
-+        let (actual, a0, a1, a2, a3): (u32, u32, u32, u32, u32);
-+        asm!(
-+            "csrr {config}, pmpcfg0",
-+            "csrr {a0}, pmpaddr0", "csrr {a1}, pmpaddr1",
-+            "csrr {a2}, pmpaddr2", "csrr {a3}, pmpaddr3",
-+            config = out(reg) actual, a0 = out(reg) a0, a1 = out(reg) a1,
-+            a2 = out(reg) a2, a3 = out(reg) a3, options(nostack),
-+        );
-+        assert_eq!(actual, config, "PMP configuration readback");
-+        assert_eq!([a0, a1, a2, a3], addresses, "PMP address readback");
 +    }
 +}
 +
@@ -425,9 +401,6 @@ index 0000000000000000000000000000000000000000..ba24af8a82253d96256fb1c264e116ab
 +    } else if cause == 8 {
 +        let saved = unsafe { &mut *current }.save_mut();
 +        saved.pc = saved.pc.checked_add(4).expect("ECALL PC overflow");
-+        with_task_table(|tasks| {
-+            let _ = task::process_timers(tasks, now());
-+        });
 +        unsafe {
 +            crate::syscalls::syscall_entry(number, current);
 +        }
@@ -451,7 +424,8 @@ index 0000000000000000000000000000000000000000..ba24af8a82253d96256fb1c264e116ab
 +            }
 +        });
 +    }
-+    // Honor syscall handoffs between peers, but never over a higher-priority wakeup.
++    // Kernel IPC (notably task restart) can wake tasks without a scheduling hint.
++    // Keep the dispatcher's peer choice unless a higher-priority task is runnable.
 +    let previous = usize::from(
 +        unsafe { &*CURRENT_TASK_PTR.load(Ordering::Relaxed) }
 +            .descriptor()
