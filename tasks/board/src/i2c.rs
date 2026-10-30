@@ -1,10 +1,7 @@
 //! Open-drain I2C on PB20/PB21. The board task owns every GPIO writer;
 //! USB can preempt transactions without touching these registers.
 
-use core::{
-    arch::asm,
-    ptr::{read_volatile, write_volatile},
-};
+use core::ptr::{read_volatile, write_volatile};
 
 const PB: usize = 0x4000_10c0;
 const INPUT: usize = 4;
@@ -13,20 +10,31 @@ const PULL_UP: usize = 16;
 const PULL_DOWN: usize = 20;
 const SDA: u32 = 1 << 20;
 const SCL: u32 = 1 << 21;
+const TMR0: usize = 0x4000_2000;
+const TIMER_WRAP: u32 = 1 << 25;
+// Fast mode's 1.3 µs minimum SCL low time, in nanoseconds; code between edges
+// counts toward it.
+const HALF_BIT_NS: u32 = 1_300;
 // Shared across every clock edge, including STOP; not a per-bit timeout.
-const STRETCH_POLLS: u32 = 20_000;
+const STRETCH_US: u32 = 20_000;
 
 use crate::BoardError as Error;
 
 pub struct I2c {
     address: u8,
-    stretch_left: u32,
+    half_bit: u32,
+    stretch_limit: u32,
+    edge: u32,
+    transaction_start: u32,
 }
 
 impl I2c {
-    /// Requires exclusive access to PB20/PB21.
-    pub unsafe fn new(seven_bit_address: u8) -> Self {
+    /// Requires exclusive access to PB20/PB21/TMR0.
+    pub unsafe fn new(seven_bit_address: u8, cycles_per_us: u32) -> Self {
         unsafe {
+            write_volatile(TMR0 as *mut u8, 0x02);
+            write_volatile((TMR0 + 0x0c) as *mut u32, TIMER_WRAP);
+            write_volatile(TMR0 as *mut u8, 0x04);
             let dir = PB as *mut u32;
             let pull_up = (PB + PULL_UP) as *mut u32;
             let pull_down = (PB + PULL_DOWN) as *mut u32;
@@ -37,7 +45,10 @@ impl I2c {
         }
         Self {
             address: seven_bit_address << 1,
-            stretch_left: 0,
+            half_bit: (HALF_BIT_NS * cycles_per_us).div_ceil(1_000),
+            stretch_limit: STRETCH_US * cycles_per_us,
+            edge: 0,
+            transaction_start: 0,
         }
     }
 
@@ -68,7 +79,8 @@ impl I2c {
         &mut self,
         transfer: impl FnOnce(&mut Self) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        self.stretch_left = STRETCH_POLLS;
+        self.transaction_start = cycles();
+        self.edge = self.transaction_start;
         let result = self.start().and_then(|()| transfer(self));
         let stop = self.stop();
         result.and(stop)
@@ -87,14 +99,14 @@ impl I2c {
 
     fn start(&mut self) -> Result<(), Error> {
         self.release(SDA);
-        Self::delay();
+        self.wait();
         self.release_clock()?;
-        Self::delay();
+        self.wait();
         if !self.read_pin(SDA) {
             return Err(Error::BusBusy);
         }
         self.drive_low(SDA);
-        Self::delay();
+        self.wait();
         self.drive_low(SCL);
         Ok(())
     }
@@ -102,11 +114,11 @@ impl I2c {
     fn stop(&mut self) -> Result<(), Error> {
         self.drive_low(SCL);
         self.drive_low(SDA);
-        Self::delay();
+        self.wait();
         let result = self.release_clock();
-        Self::delay();
+        self.wait();
         self.release(SDA);
-        Self::delay();
+        self.wait();
         result
     }
 
@@ -117,15 +129,15 @@ impl I2c {
             } else {
                 self.drive_low(SDA);
             }
-            Self::delay();
+            self.wait();
             self.release_clock()?;
-            Self::delay();
+            self.wait();
             self.drive_low(SCL);
         }
         self.release(SDA);
-        Self::delay();
+        self.wait();
         self.release_clock()?;
-        Self::delay();
+        self.wait();
         let ack = !self.read_pin(SDA);
         self.drive_low(SCL);
         if ack { Ok(()) } else { Err(Error::Nack) }
@@ -135,18 +147,18 @@ impl I2c {
         self.release(SDA);
         let mut byte = 0u8;
         for _ in 0..8 {
-            Self::delay();
+            self.wait();
             self.release_clock()?;
-            Self::delay();
+            self.wait();
             byte = (byte << 1) | u8::from(self.read_pin(SDA));
             self.drive_low(SCL);
         }
         if ack {
             self.drive_low(SDA);
         }
-        Self::delay();
+        self.wait();
         self.release_clock()?;
-        Self::delay();
+        self.wait();
         self.drive_low(SCL);
         self.release(SDA);
         Ok(byte)
@@ -155,11 +167,12 @@ impl I2c {
     fn release_clock(&mut self) -> Result<(), Error> {
         self.release(SCL);
         while !self.read_pin(SCL) {
-            if self.stretch_left == 0 {
+            if since(self.transaction_start) >= self.stretch_limit {
                 return Err(Error::ClockTimeout);
             }
-            self.stretch_left -= 1;
         }
+        // A stretched clock's high time starts when the target releases it.
+        self.edge = cycles();
         Ok(())
     }
 
@@ -181,11 +194,17 @@ impl I2c {
         unsafe { read_volatile((PB + INPUT) as *const u32) & pin != 0 }
     }
 
-    fn delay() {
-        // At least 1.5 µs at 60 MHz, over fast mode's 1.3 µs minimum SCL low time.
-        // SCL rises are self-timed by release_clock; SDA relies on this delay.
-        for _ in 0..30 {
-            unsafe { asm!("nop", options(nomem, nostack)) };
-        }
+    /// Waits until half a bit time has passed since the previous edge.
+    fn wait(&mut self) {
+        while since(self.edge) < self.half_bit {}
+        self.edge = cycles();
     }
+}
+
+fn cycles() -> u32 {
+    unsafe { read_volatile((TMR0 + 8) as *const u32) }
+}
+
+fn since(start: u32) -> u32 {
+    cycles().wrapping_sub(start) & (TIMER_WRAP - 1)
 }

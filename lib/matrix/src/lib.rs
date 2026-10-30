@@ -45,9 +45,7 @@ const PULL_DOWN_DRIVE: usize = 20;
 // Every sense column and released drive row; all read high while no row is driven.
 const PA_MATRIX: u32 = 0xf20f;
 const PB_MATRIX: u32 = 0x000f_037f;
-// About 1.5 µs at 60 MHz: a driven row pulls closed keys' columns low through a
-// strong output, so only the GPIO input path needs time.
-const DRIVE_NOPS: u32 = 32;
+const DRIVE_NOPS: u32 = 4;
 // Bounds the pull-up recovery wait if a column is stuck low.
 const RECOVERY_POLLS: u32 = 256;
 

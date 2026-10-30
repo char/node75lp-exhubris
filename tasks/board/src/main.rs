@@ -28,8 +28,15 @@ const LED_POWER: u32 = 1 << 15;
 
 #[unsafe(export_name = "main")]
 fn main() -> ! {
+    let config = unsafe { read_volatile(0x4000_1008 as *const u16) };
+    let divisor = u32::from(config & 0x1f).max(1);
+    let cycles_per_us = match config & 0xc0 {
+        0x00 => 32 / divisor,
+        0x40 => 480 / divisor,
+        _ => 32,
+    };
     let mut server = Server {
-        i2c: unsafe { i2c::I2c::new(0x44) },
+        i2c: unsafe { i2c::I2c::new(0x44, cycles_per_us) },
         keyboard: Node75Keyboard::from(SLOTS.keyboard),
         debounce: Debouncer::default(),
         sent: None,
