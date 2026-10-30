@@ -182,8 +182,9 @@ impl I2c {
     }
 
     fn delay() {
-        // Conservative at 60 MHz; verify SCL timing on the board.
-        for _ in 0..100 {
+        // At least 1.5 µs at 60 MHz, over fast mode's 1.3 µs minimum SCL low time.
+        // SCL rises are self-timed by release_clock; SDA relies on this delay.
+        for _ in 0..30 {
             unsafe { asm!("nop", options(nomem, nostack)) };
         }
     }
